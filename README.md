@@ -1,0 +1,126 @@
+# QtMesh Agents
+
+**One terminal. Multiple AI agents. Unified orchestration.**
+
+QtMesh Agents (`qma`) is an open-source, terminal-first control center for launching, managing, and orchestrating AI coding agents from multiple vendors (Claude Code, OpenAI Codex, Cursor Agent, and more).
+
+It runs as a lightweight Go daemon that owns agent processes and PTYs. The CLI and Bubble Tea TUI are clients — closing the UI never kills your agents.
+
+## Features (Phase 1)
+
+- Unified CLI: `qma` (alias `qtmesh-agents`)
+- Persistent background daemon with Unix domain socket IPC
+- Interactive sessions with PTY attach/detach
+- Adapters for Claude Code, Codex, Cursor Agent, plus a mock agent for CI
+- SQLite persistence for projects, sessions, and events
+- Bubble Tea TUI for projects, agents, sessions, and orchestrator notes
+- Project registry (`qma project add|list|use`)
+- Status, history, logs, and `agents doctor`
+
+Phase 2 adds a conversational multi-project orchestrator:
+
+```bash
+qma project add ~/projects/QtMeshEditor
+qma project add ~/projects/Data-Core-Clash
+qma chat   # talk across all projects — no need to select one
+# or:
+qma chat "In QtMeshEditor, add hair materials; in Data Core Clash, fix matchmaking"
+qma run status <run-id> --follow
+qma run diff <run-id>
+```
+
+See [docs/implementation-plan.md](docs/implementation-plan.md).
+
+## Install
+
+```bash
+git clone https://github.com/fernandotonon/QtMesh-Agents.git
+cd QtMesh-Agents
+make install   # installs qma to $(go env GOPATH)/bin
+# or
+make build     # writes ./bin/qma
+```
+
+Requires Go 1.22+ (developed with the current stable toolchain).
+
+## Quick start
+
+```bash
+# Write default config and probe installed agent CLIs
+qma init
+
+# Start / inspect the daemon (also auto-starts on demand)
+qma daemon start
+qma daemon status
+
+# Register a project
+qma project add ~/projects/MyApp
+qma project use MyApp
+
+# Spawn real agents (must be on PATH)
+qma spawn claude
+qma spawn codex
+qma sessions
+qma attach <session-id>   # raw terminal; detach with the client exit
+
+# Or open the TUI
+qma
+```
+
+Inside the TUI:
+
+| Key / command | Action |
+|---|---|
+| `spawn claude` | Start Claude and attach |
+| `attach <id>` | Attach to a running session |
+| `stop <id>` | Terminate a session |
+| `detach` | Detach without killing |
+| `Tab` | Toggle orchestrator / agent view |
+| `q` / `Ctrl+C` | Quit TUI (agents keep running) |
+
+## Configuration
+
+Default path: `~/.config/qtmesh-agents/config.yaml`
+
+See [examples/config.yaml](examples/config.yaml). Data and logs live under `~/.local/share/qtmesh-agents/`.
+
+## Architecture
+
+```text
+CLI / TUI  ──Unix socket──►  daemon (sessions, PTY, SQLite)
+                                 │
+                    Claude / Codex / Cursor / mock
+```
+
+Details: [docs/architecture.md](docs/architecture.md)
+
+## Development
+
+```bash
+make test
+make vet
+go test ./...
+```
+
+CI uses the mock adapter so no paid provider credentials are required.
+
+Optional live checks (when CLIs are installed):
+
+```bash
+qma agents doctor
+```
+
+## Security (MVP)
+
+Coding agents can run shell commands and modify files. QtMesh Agents:
+
+- Does not bypass provider sandboxes or auth prompts
+- Requires human approval for merges (orchestrator Phase 2+)
+- Applies timeouts and concurrency limits
+- Treats agent output and generated plans as untrusted
+
+You are responsible for reviewing agent changes before merging.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

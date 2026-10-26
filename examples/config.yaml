@@ -1,0 +1,47 @@
+orchestrator:
+  # heuristic = local deterministic planner (default)
+  # claude|codex|cursor = ask that provider for a JSON plan (falls back to heuristic)
+  provider: heuristic
+  maxPlanningIterations: 5
+  requireApprovalForMerge: true
+
+agents:
+  claude:
+    enabled: true
+    command: claude
+  codex:
+    enabled: true
+    command: codex
+  cursor:
+    enabled: true
+    command: cursor-agent
+  mock:
+    enabled: true
+    command: qma-mock-agent
+
+execution:
+  maxConcurrentAgents: 3
+  timeoutMinutes: 30
+  maxRetries: 2
+  useGitWorktrees: true
+
+routing:
+  strategy: balanced
+  preferences:
+    architecture: claude
+    implementation: codex
+    frontend: cursor
+    testing: codex
+    review: claude
+  fallback:
+    - codex
+    - claude
+    - cursor
+  maxConcurrentAgents: 3
+
+storage:
+  driver: sqlite
+
+ui:
+  theme: dark
+  showUsage: true

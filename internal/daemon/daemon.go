@@ -1,0 +1,664 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fernandotonon/QtMesh-Agents/internal/agents"
+	"github.com/fernandotonon/QtMesh-Agents/internal/agents/claude"
+	"github.com/fernandotonon/QtMesh-Agents/internal/agents/codex"
+	"github.com/fernandotonon/QtMesh-Agents/internal/agents/cursor"
+	"github.com/fernandotonon/QtMesh-Agents/internal/agents/mock"
+	"github.com/fernandotonon/QtMesh-Agents/internal/config"
+	"github.com/fernandotonon/QtMesh-Agents/internal/events"
+	"github.com/fernandotonon/QtMesh-Agents/internal/ipc"
+	"github.com/fernandotonon/QtMesh-Agents/internal/orchestrator"
+	"github.com/fernandotonon/QtMesh-Agents/internal/projects"
+	"github.com/fernandotonon/QtMesh-Agents/internal/sessions"
+	"github.com/fernandotonon/QtMesh-Agents/internal/storage"
+	"github.com/fernandotonon/QtMesh-Agents/pkg/version"
+)
+
+// Daemon is the persistent process owner.
+type Daemon struct {
+	cfg       config.Config
+	store     *storage.Store
+	registry  *agents.Registry
+	sessions  *sessions.Manager
+	projects  *projects.Service
+	orch      *orchestrator.Engine
+	conductor *orchestrator.Conductor
+	socket    string
+	ln        net.Listener
+	log       *slog.Logger
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+}
+
+// Options configures daemon startup.
+type Options struct {
+	Config     config.Config
+	SocketPath string
+	Logger     *slog.Logger
+}
+
+// Start creates and runs a daemon (blocking accept loop in goroutine).
+func Start(ctx context.Context, opts Options) (*Daemon, error) {
+	if err := config.EnsureDirs(); err != nil {
+		return nil, err
+	}
+	cfg := opts.Config
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	socket := opts.SocketPath
+	if socket == "" {
+		var err error
+		socket, err = ipc.DefaultSocketPath()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Daemon.SocketPath != "" {
+		socket = cfg.Daemon.SocketPath
+	}
+
+	dataDir, err := config.DataDir()
+	if err != nil {
+		return nil, err
+	}
+	dbPath := cfg.Storage.Path
+	if dbPath == "" {
+		dbPath = filepath.Join(dataDir, "qtmesh-agents.db")
+	}
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	reg := agents.NewRegistry()
+	reg.Register(claude.New(cfg.Agents.Claude.Command, cfg.Agents.Claude.Args))
+	reg.Register(codex.New(cfg.Agents.Codex.Command, cfg.Agents.Codex.Args))
+	reg.Register(cursor.New(cfg.Agents.Cursor.Command, cfg.Agents.Cursor.Args))
+	reg.Register(mock.New(cfg.Agents.Mock.Command, cfg.Agents.Mock.Args))
+
+	logDir := filepath.Join(dataDir, "logs")
+	mgr := sessions.NewManager(store, reg, logDir)
+	if err := mgr.RecoverOnStart(ctx); err != nil {
+		opts.Logger.Warn("session recovery", "err", err)
+	}
+
+	proj := projects.New(store)
+
+	planner := orchestrator.Planner(orchestrator.HeuristicPlanner{})
+	provider := strings.ToLower(strings.TrimSpace(cfg.Orchestrator.Provider))
+	if provider != "" && provider != "heuristic" {
+		if adapter, ok := reg.Get(provider); ok {
+			planner = orchestrator.ProviderPlanner{
+				Adapter:  adapter,
+				Fallback: orchestrator.HeuristicPlanner{},
+			}
+		}
+	}
+	orch := orchestrator.New(orchestrator.Deps{
+		Config:   cfg,
+		Store:    store,
+		Registry: reg,
+		Planner:  planner,
+		Logger:   opts.Logger,
+	})
+
+	var chatAdapter agents.AgentAdapter
+	if provider != "" && provider != "heuristic" {
+		if a, ok := reg.Get(provider); ok {
+			chatAdapter = a
+		}
+	}
+	if chatAdapter == nil {
+		// Prefer claude for conversation when available; else any detected provider.
+		for _, id := range []string{"claude", "codex", "cursor"} {
+			if a, ok := reg.Get(id); ok {
+				if det, _ := a.Detect(ctx); det {
+					chatAdapter = a
+					break
+				}
+			}
+		}
+	}
+	conductor := orchestrator.NewConductor(orch, proj, chatAdapter)
+
+	ln, err := ipc.Listen(socket)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("listen %s: %w", socket, err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	d := &Daemon{
+		cfg:       cfg,
+		store:     store,
+		registry:  reg,
+		sessions:  mgr,
+		projects:  proj,
+		orch:      orch,
+		conductor: conductor,
+		socket:    socket,
+		ln:        ln,
+		log:       opts.Logger,
+		cancel:    cancel,
+	}
+
+	_ = d.recordEvent(runCtx, events.New(events.KindDaemonStarted, "daemon started"))
+
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		d.acceptLoop(runCtx)
+	}()
+
+	d.log.Info("daemon listening", "socket", socket, "pid", os.Getpid())
+	return d, nil
+}
+
+func (d *Daemon) acceptLoop(ctx context.Context) {
+	for {
+		conn, err := d.ln.Accept()
+		if err != nil {
+			// Listener closed during shutdown, or fatal accept error.
+			return
+		}
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			d.handleConn(ctx, conn)
+		}()
+	}
+}
+
+func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	codec := ipc.NewCodec(conn)
+	var attached string
+	var sub chan []byte
+
+	cleanupAttach := func() {
+		if attached != "" && sub != nil {
+			if ls, ok := d.sessions.Get(attached); ok {
+				ls.Unsubscribe(sub)
+			}
+			attached = ""
+			sub = nil
+		}
+	}
+	defer cleanupAttach()
+
+	// Output pump when attached.
+	outDone := make(chan struct{})
+	defer close(outDone)
+
+	for {
+		env, err := codec.Read()
+		if err != nil {
+			return
+		}
+		switch env.Type {
+		case ipc.TypePing:
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypePong, ID: env.ID})
+		case ipc.TypeShutdown:
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+			go d.Stop()
+			return
+		case ipc.TypeStatus:
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeStatusResp,
+				ID:   env.ID,
+				Payload: ipc.MustPayload(ipc.StatusResponse{
+					DaemonRunning: true,
+					PID:           os.Getpid(),
+					Sessions:      d.sessions.CountRunning(),
+					Version:       version.Version,
+					SocketPath:    d.socket,
+				}),
+			})
+		case ipc.TypeSpawn:
+			req, err := ipc.DecodePayload[ipc.SpawnRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			workDir := req.WorkDir
+			projectID := req.ProjectID
+			if workDir == "" {
+				if p, err := d.projects.Active(ctx); err == nil {
+					workDir = p.Path
+					if projectID == "" {
+						projectID = p.ID
+					}
+				}
+			}
+			ls, err := d.sessions.Spawn(ctx, sessions.SpawnOpts{
+				AgentID:   req.AgentID,
+				ProjectID: projectID,
+				WorkDir:   workDir,
+				Cols:      req.Cols,
+				Rows:      req.Rows,
+				ResumeID:  req.ResumeID,
+				ExtraArgs: req.ExtraArgs,
+				Prompt:    req.Prompt,
+			})
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = d.recordEvent(ctx, events.Event{
+				Kind: events.KindSessionStarted, Timestamp: time.Now().UTC(),
+				SessionID: ls.Info.ID, AgentID: ls.Info.AgentID, ProjectID: projectID,
+				Message: "session started",
+			})
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeSpawnResp, ID: env.ID,
+				Payload: ipc.MustPayload(ipc.SpawnResponse{SessionID: ls.Info.ID, PID: ls.Info.PID}),
+			})
+		case ipc.TypeListSessions:
+			live := d.sessions.ListLive()
+			infos := make([]ipc.SessionInfo, 0, len(live))
+			for _, ls := range live {
+				infos = append(infos, ipc.SessionInfo{
+					ID: ls.Info.ID, AgentID: ls.Info.AgentID, ProjectID: ls.Info.ProjectID,
+					WorkDir: ls.Info.WorkDir, Status: ls.Info.Status, PID: ls.Info.PID,
+					CreatedAt: ls.Info.CreatedAt.Format(time.RFC3339),
+				})
+			}
+			// Also include recently stopped from store.
+			if recs, err := d.store.ListSessions(ctx); err == nil {
+				seen := map[string]bool{}
+				for _, i := range infos {
+					seen[i.ID] = true
+				}
+				for _, r := range recs {
+					if seen[r.ID] {
+						continue
+					}
+					infos = append(infos, ipc.SessionInfo{
+						ID: r.ID, AgentID: r.AgentID, ProjectID: r.ProjectID,
+						WorkDir: r.WorkDir, Status: r.Status, PID: r.PID,
+						CreatedAt: r.CreatedAt.Format(time.RFC3339),
+					})
+				}
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeSessions, ID: env.ID, Payload: ipc.MustPayload(infos)})
+		case ipc.TypeAttach:
+			req, err := ipc.DecodePayload[ipc.SessionRef](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			cleanupAttach()
+			ls, ok := d.sessions.Get(req.SessionID)
+			if !ok {
+				d.writeErr(codec, env.ID, fmt.Errorf("session %q not running", req.SessionID))
+				continue
+			}
+			attached = req.SessionID
+			sub = ls.Subscribe()
+			// Replay buffer.
+			if hist := ls.Buffer.Bytes(); len(hist) > 0 {
+				_ = codec.Write(ipc.Envelope{
+					Type: ipc.TypeOutput,
+					Payload: ipc.MustPayload(ipc.OutputEvent{SessionID: attached, Data: hist}),
+				})
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+			go d.forwardOutput(codec, attached, sub, outDone)
+		case ipc.TypeDetach:
+			cleanupAttach()
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeInput:
+			req, err := ipc.DecodePayload[ipc.InputRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.sessions.Write(req.SessionID, req.Data); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeResize:
+			req, err := ipc.DecodePayload[ipc.ResizeRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.sessions.Resize(req.SessionID, req.Cols, req.Rows); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeStop:
+			req, err := ipc.DecodePayload[ipc.SessionRef](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.sessions.Stop(req.SessionID); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = d.recordEvent(ctx, events.Event{
+				Kind: events.KindSessionStopped, Timestamp: time.Now().UTC(),
+				SessionID: req.SessionID, Message: "session stopped",
+			})
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeListProjects:
+			list, err := d.projects.List(ctx)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			infos := make([]ipc.ProjectInfo, 0, len(list))
+			for _, p := range list {
+				infos = append(infos, ipc.ProjectInfo{ID: p.ID, Name: p.Name, Path: p.Path, Active: p.Active})
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeProjects, ID: env.ID, Payload: ipc.MustPayload(infos)})
+		case ipc.TypeAddProject:
+			req, err := ipc.DecodePayload[ipc.AddProjectRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			p, err := d.projects.Add(ctx, req.Path, req.Name)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeProjects, ID: env.ID,
+				Payload: ipc.MustPayload([]ipc.ProjectInfo{{ID: p.ID, Name: p.Name, Path: p.Path, Active: p.Active}}),
+			})
+		case ipc.TypeUseProject:
+			req, err := ipc.DecodePayload[ipc.UseProjectRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.projects.Use(ctx, req.ID); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeListAgents:
+			infos := d.agentInfos(ctx)
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeAgents, ID: env.ID, Payload: ipc.MustPayload(infos)})
+		case ipc.TypeRunStart:
+			req, err := ipc.DecodePayload[ipc.RunStartRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			workDir := req.WorkDir
+			projectID := req.ProjectID
+			if workDir == "" || projectID == "" {
+				if resolved, err := d.resolveProject(ctx, projectID, req.Objective); err == nil {
+					if projectID == "" {
+						projectID = resolved.ID
+					}
+					if workDir == "" {
+						workDir = resolved.Path
+					}
+				} else if p, err := d.projects.Active(ctx); err == nil {
+					// Active project is optional fallback only.
+					if workDir == "" {
+						workDir = p.Path
+					}
+					if projectID == "" {
+						projectID = p.ID
+					}
+				}
+			}
+			runID, err := d.orch.StartRun(ctx, orchestrator.PlanRequest{
+				Objective:     req.Objective,
+				ProjectID:     projectID,
+				WorkDir:       workDir,
+				AgentOverride: req.AgentOverride,
+			})
+			if err != nil && runID == "" {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeRunStartResp, ID: env.ID,
+				Payload: ipc.MustPayload(ipc.RunStartResponse{RunID: runID}),
+			})
+		case ipc.TypeChat:
+			req, err := ipc.DecodePayload[ipc.ChatRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			res, err := d.conductor.Chat(ctx, req.Message)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			actions := make([]ipc.ChatActionInfo, 0, len(res.Actions))
+			for _, a := range res.Actions {
+				actions = append(actions, ipc.ChatActionInfo{
+					Type: a.Type, ProjectID: a.ProjectID, Objective: a.Objective, RunID: a.RunID,
+				})
+			}
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeChatResp, ID: env.ID,
+				Payload: ipc.MustPayload(ipc.ChatResponse{Reply: res.Reply, Actions: actions}),
+			})
+		case ipc.TypeChatHistory:
+			hist := d.conductor.History()
+			msgs := make([]ipc.ChatHistoryMessage, 0, len(hist))
+			for _, m := range hist {
+				msgs = append(msgs, ipc.ChatHistoryMessage{
+					Role: m.Role, Content: m.Content, Timestamp: m.Timestamp.Format(time.RFC3339),
+				})
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeChatHistoryResp, ID: env.ID, Payload: ipc.MustPayload(msgs)})
+		case ipc.TypeChatClear:
+			d.conductor.ClearHistory()
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeRunStatus:
+			req, err := ipc.DecodePayload[ipc.RunRef](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			info, err := d.runInfo(ctx, req.RunID)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeRunStatusResp, ID: env.ID, Payload: ipc.MustPayload(info)})
+		case ipc.TypeRunList:
+			list, err := d.store.ListRuns(ctx, 50)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			infos := make([]ipc.RunInfo, 0, len(list))
+			for _, r := range list {
+				infos = append(infos, runToInfo(r, nil))
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeRunListResp, ID: env.ID, Payload: ipc.MustPayload(infos)})
+		case ipc.TypeRunCancel:
+			req, err := ipc.DecodePayload[ipc.RunRef](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.orch.CancelRun(req.RunID); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		default:
+			d.writeErr(codec, env.ID, fmt.Errorf("unknown type %q", env.Type))
+		}
+	}
+}
+
+func (d *Daemon) runInfo(ctx context.Context, runID string) (ipc.RunInfo, error) {
+	r, err := d.store.GetRun(ctx, runID)
+	if err != nil {
+		return ipc.RunInfo{}, err
+	}
+	tasks, err := d.store.ListTasksByRun(ctx, runID)
+	if err != nil {
+		return ipc.RunInfo{}, err
+	}
+	return runToInfo(r, tasks), nil
+}
+
+// resolveProject picks a project from an explicit id/name or by matching the objective text.
+// It does not require an "active" project.
+func (d *Daemon) resolveProject(ctx context.Context, idOrName, objective string) (storage.Project, error) {
+	list, err := d.projects.List(ctx)
+	if err != nil {
+		return storage.Project{}, err
+	}
+	if idOrName != "" {
+		for _, p := range list {
+			if strings.EqualFold(p.ID, idOrName) || strings.EqualFold(p.Name, idOrName) {
+				return p, nil
+			}
+		}
+		return storage.Project{}, fmt.Errorf("project %q not found", idOrName)
+	}
+	refs := make([]orchestrator.ProjectRef, 0, len(list))
+	for _, p := range list {
+		refs = append(refs, orchestrator.ProjectRef{ID: p.ID, Name: p.Name, Path: p.Path})
+	}
+	matched := orchestrator.MatchProjects(objective, refs)
+	if len(matched) == 1 {
+		for _, p := range list {
+			if p.ID == matched[0].ID {
+				return p, nil
+			}
+		}
+	}
+	if len(list) == 1 {
+		return list[0], nil
+	}
+	if len(matched) > 1 {
+		return storage.Project{}, fmt.Errorf("ambiguous project in objective; mention one of: %s", joinProjectNames(matched))
+	}
+	return storage.Project{}, fmt.Errorf("no project resolved — mention a registered project name in the objective")
+}
+
+func joinProjectNames(refs []orchestrator.ProjectRef) string {
+	names := make([]string, len(refs))
+	for i, r := range refs {
+		names[i] = r.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+func runToInfo(r storage.Run, tasks []storage.TaskRecord) ipc.RunInfo {
+	info := ipc.RunInfo{
+		ID: r.ID, ProjectID: r.ProjectID, Objective: r.Objective, Status: r.Status,
+		Planner: r.Planner, WorkDir: r.WorkDir,
+		CreatedAt: r.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: r.UpdatedAt.Format(time.RFC3339),
+		Summary:   r.Summary, Error: r.Error,
+	}
+	if r.EndedAt != nil {
+		info.EndedAt = r.EndedAt.Format(time.RFC3339)
+	}
+	for _, t := range tasks {
+		info.Tasks = append(info.Tasks, ipc.TaskInfo{
+			ID: t.ID, Description: t.Description, Category: t.Category, Status: t.Status,
+			AssignedAgent: t.AssignedAgent, Dependencies: t.Dependencies, Error: t.Error,
+			DiffPath: t.DiffPath, WorktreePath: t.WorktreePath, Branch: t.Branch, RetryCount: t.RetryCount,
+		})
+	}
+	return info
+}
+
+func (d *Daemon) forwardOutput(codec *ipc.Codec, sessionID string, sub chan []byte, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case data, ok := <-sub:
+			if !ok {
+				return
+			}
+			_ = codec.Write(ipc.Envelope{
+				Type:    ipc.TypeOutput,
+				Payload: ipc.MustPayload(ipc.OutputEvent{SessionID: sessionID, Data: data}),
+			})
+		}
+	}
+}
+
+func (d *Daemon) agentInfos(ctx context.Context) []ipc.AgentInfo {
+	var out []ipc.AgentInfo
+	for _, a := range d.registry.List() {
+		entry, _ := d.cfg.AgentByID(a.ID())
+		detected, _ := a.Detect(ctx)
+		info := ipc.AgentInfo{
+			ID: a.ID(), Vendor: a.Vendor(), Command: entry.Command,
+			Detected: detected, Enabled: entry.Enabled,
+		}
+		if caps, err := a.Capabilities(ctx); err == nil {
+			info.Version = caps.Version
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+func (d *Daemon) writeErr(codec *ipc.Codec, id string, err error) {
+	_ = codec.Write(ipc.Envelope{
+		Type: ipc.TypeError, ID: id,
+		Payload: ipc.MustPayload(ipc.ErrorPayload{Message: err.Error()}),
+	})
+}
+
+func (d *Daemon) recordEvent(ctx context.Context, ev events.Event) error {
+	if ev.ID == "" {
+		ev.ID = fmt.Sprintf("evt-%d", time.Now().UnixNano())
+	}
+	data, _ := json.Marshal(ev.Data)
+	return d.store.InsertEvent(ctx, ev.ID, string(ev.Kind), ev.Timestamp.Format(time.RFC3339),
+		ev.SessionID, ev.ProjectID, ev.AgentID, ev.TaskID, ev.Message, string(data))
+}
+
+// Stop shuts down the daemon.
+func (d *Daemon) Stop() {
+	d.log.Info("daemon stopping")
+	_ = d.recordEvent(context.Background(), events.New(events.KindDaemonStopped, "daemon stopped"))
+	d.cancel()
+	_ = d.ln.Close()
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		d.log.Warn("shutdown timed out waiting for connections")
+	}
+	_ = d.store.Close()
+}
+
+// SocketPath returns the listening socket.
+func (d *Daemon) SocketPath() string { return d.socket }
+
+// Wait blocks until the daemon stops.
+func (d *Daemon) Wait() { d.wg.Wait() }

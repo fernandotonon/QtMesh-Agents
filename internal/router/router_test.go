@@ -1,0 +1,39 @@
+package router
+
+import (
+	"testing"
+
+	"github.com/fernandotonon/QtMesh-Agents/internal/config"
+)
+
+func TestSelectPreferred(t *testing.T) {
+	cfg := config.Default().Routing
+	r := New(cfg, map[string]bool{"claude": true, "codex": true, "cursor": true})
+	sel, err := r.Select("architecture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel.AgentID != "claude" {
+		t.Fatalf("got %s", sel.AgentID)
+	}
+}
+
+func TestSelectFallback(t *testing.T) {
+	cfg := config.Default().Routing
+	r := New(cfg, map[string]bool{"claude": false, "codex": true, "cursor": false})
+	sel, err := r.Select("architecture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel.AgentID != "codex" {
+		t.Fatalf("got %s", sel.AgentID)
+	}
+}
+
+func TestSelectNone(t *testing.T) {
+	cfg := config.Default().Routing
+	r := New(cfg, map[string]bool{})
+	if _, err := r.Select("testing"); err == nil {
+		t.Fatal("expected error")
+	}
+}

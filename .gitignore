@@ -28,6 +28,18 @@ go.work.sum
 # env file
 .env
 
+# Build artifacts
+bin/
+dist/
+
+# Local runtime
+*.db
+*.db-shm
+*.db-wal
+
+# Orchestrator worktrees
+.qma-worktrees/
+
 # Editor/IDE
 # .idea/
 # .vscode/
