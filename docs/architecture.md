@@ -36,6 +36,37 @@ QtMesh Agents is a terminal-first orchestrator for multi-vendor AI coding agents
 5. **Human gates.** Merges and destructive ops require approval.
 6. **Small interfaces.** Defined close to consumers; DI via constructors.
 
+## Project benches
+
+Hierarchy:
+
+```text
+Top orchestrator (conductor)
+  └── Project bench (one per registered project)
+        ├── Leader agent (plans / prioritizes)
+        └── Worker agents (implement / test / review)
+```
+
+- Starting a run calls `EnsureBench` — seats a leader (prefer Claude) and detected workers.
+- Plans begin with a `lead` (leadership) task, then discover → impl → verify → integrate.
+- Codex workers run with `approval_policy=never` + `--sandbox workspace-write` (unattended).
+  (`--approve-for-me` alone leaves `approval: on-request`, which hangs when Codex is configured
+  with `approvals_reviewer=user` — waiting for ChatGPT app confirmation we never surface.)
+- Agent stdout is streamed; permission/auth prompts raise a ⚠ mid-run (not only after timeout).
+- When an agent still cannot proceed, the task becomes `awaiting_input`, the run `needs_attention`,
+  and an **attention mark** (⚠) is raised for the human (`qma attention list` / TUI).
+- Simple chat (status, attention, projects, thanks) is answered by the orchestrator without a full run.
+
+## Routing defaults
+
+Category preferences select Cursor for implementation, Codex for frontend and testing,
+and Claude for architecture and review. Preferences take priority over the shared
+fallback order (`codex`, `claude`, `cursor`), which remains unchanged to preserve
+behavior for other categories when their preferred agent is unavailable.
+
+After changing `~/.config/qtmesh-agents/config.yaml`, the daemon may need a restart
+or reload for live routing to use the new preferences on new runs.
+
 ## Packages
 
 | Package | Responsibility |
@@ -44,7 +75,7 @@ QtMesh Agents is a terminal-first orchestrator for multi-vendor AI coding agents
 | `internal/cli` | Cobra command tree |
 | `internal/tui` | Bubble Tea client UI |
 | `internal/daemon` | Process owner, queues, recovery |
-| `internal/ipc` | Local transport (Unix sockets; Windows abstraction) |
+| `internal/ipc` | Local transport (Unix sockets; Windows named pipes) |
 | `internal/agents` | Adapter interfaces + registry |
 | `internal/agents/*` | Claude, Codex, Cursor, mock adapters |
 | `internal/sessions` | Interactive session lifecycle + buffers |
@@ -54,7 +85,7 @@ QtMesh Agents is a terminal-first orchestrator for multi-vendor AI coding agents
 | `internal/router` | Agent selection policy |
 | `internal/execution` | Headless task execution |
 | `internal/worktree` | Git worktree isolation |
-| `internal/review` | Change review / approval (Phase 3) |
+| `internal/review` | Static diff review (secrets/conflicts/size); wired from verify + integrate |
 | `internal/projects` | Multi-repo project registry |
 | `internal/storage` | SQLite persistence + migrations |
 | `internal/config` | YAML config load/validate |
@@ -84,7 +115,7 @@ Protocol: length-prefixed JSON messages over a stream connection.
 Message kinds include: `ping`, `status`, `spawn`, `attach`, `detach`, `input`, `resize`, `stop`, `list_sessions`, `list_projects`, `event`, `output`.
 
 Unix: `$XDG_RUNTIME_DIR/qtmesh-agents/daemon.sock` (fallback `~/.qtmesh-agents/daemon.sock`).  
-Windows: named-pipe abstraction behind the same `Transport` interface.
+Windows: native local named pipes behind the same Listen/Dial API, with dial timeouts and no TCP marker files.
 
 ## Agent adapters
 
@@ -121,3 +152,12 @@ SQLite (WAL) stores projects, sessions, tasks, dependencies, events, reviews, wo
 ## Extension points (future)
 
 Web dashboard, remote workers, MCP, GitHub/GitLab, Gemini/OpenCode/Ollama adapters, cost-aware routing, QtMeshEditor integration.
+
+### Distribution and first run
+
+`qma init` retains existing configuration (or writes defaults), detects agent CLIs,
+and offers to register the current directory on a TTY. Non-TTY input and
+`--non-interactive` skip prompts. Setup prints next-step commands.
+`scripts/install.sh` installs release archives after SHA-256 verification or a
+local binary into `~/.local/bin`. GoReleaser embeds version, commit, and build
+date; `make release-snapshot` creates local archives without publishing.

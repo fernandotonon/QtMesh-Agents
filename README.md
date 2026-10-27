@@ -33,6 +33,21 @@ See [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install
 
+Install the latest release (macOS/Linux):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fernandotonon/QtMesh-Agents/main/scripts/install.sh | bash
+# Pin a release or install a local build:
+bash scripts/install.sh --version v0.1.0
+bash scripts/install.sh --binary ./bin/qma
+```
+
+The default destination is `~/.local/bin`; add it to PATH if prompted. Override
+with `--dir` or `QMA_INSTALL_DIR`. Downloads are checked against release SHA-256
+checksums. Windows users can extract `qma.exe` from the release zip onto PATH.
+
+Build from source:
+
 ```bash
 git clone https://github.com/fernandotonon/QtMesh-Agents.git
 cd QtMesh-Agents
@@ -41,13 +56,17 @@ make install   # installs qma to $(go env GOPATH)/bin
 make build     # writes ./bin/qma
 ```
 
-Requires Go 1.22+ (developed with the current stable toolchain).
+Requires the Go toolchain specified in `go.mod`.
+
+For local release archives, run `make release-snapshot` (GoReleaser v2), or
+`goreleaser release --snapshot --clean`; neither publishes nor requires pushing tags.
 
 ## Quick start
 
 ```bash
-# Write default config and probe installed agent CLIs
+# Set up config, detect agents, and optionally register this directory
 qma init
+# Scripts / CI: qma init --non-interactive (also automatic when stdin is not a TTY)
 
 # Start / inspect the daemon (also auto-starts on demand)
 qma daemon start

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,63 @@ func TestHeuristicChatStartsRun(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("timeout waiting for chat-started run")
+}
+
+func TestSimpleIntentHandlesStatus(t *testing.T) {
+	base := t.TempDir()
+	store, err := storage.Open(base + "/db.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	eng := New(Deps{Config: config.Default(), Store: store, Planner: HeuristicPlanner{}})
+	c := NewConductor(eng, memProjects{list: []storage.Project{
+		{ID: "demo", Name: "Demo", Path: base},
+	}}, nil)
+	res, err := c.Chat(context.Background(), "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Actions) != 0 {
+		t.Fatalf("status should not start runs: %+v", res.Actions)
+	}
+	if !strings.Contains(strings.ToLower(res.Reply), "orchestrator") {
+		t.Fatalf("reply=%q", res.Reply)
+	}
+}
+
+func TestHeuristicContinueSingleProject(t *testing.T) {
+	base := t.TempDir()
+	store, err := storage.Open(base + "/db.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	reg := agents.NewRegistry()
+	reg.Register(mock.New("", nil))
+	cfg := config.Default()
+	cfg.Agents.Mock.Enabled = true
+	eng := New(Deps{Config: cfg, Store: store, Registry: reg, Planner: HeuristicPlanner{}})
+	c := NewConductor(eng, memProjects{list: []storage.Project{
+		{ID: "qtmesh-agents", Name: "QtMesh-Agents", Path: base},
+	}}, nil)
+	c.SetForceAgent("mock")
+
+	res, err := c.Chat(context.Background(), "continue the work you made so far")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Actions) != 1 {
+		t.Fatalf("expected continue to start a run, actions=%+v reply=%s", res.Actions, res.Reply)
+	}
+	if !stringsContainsFold(res.Actions[0].Objective, "continue unfinished") {
+		t.Fatalf("expected strengthened continue objective, got %q", res.Actions[0].Objective)
+	}
+}
+
+func stringsContainsFold(s, sub string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }
 
 func TestHeuristicAsksWhenAmbiguous(t *testing.T) {

@@ -27,13 +27,14 @@ type Task struct {
 type TaskStatus string
 
 const (
-	StatusPending   TaskStatus = "pending"
-	StatusReady     TaskStatus = "ready"
-	StatusRunning   TaskStatus = "running"
-	StatusSucceeded TaskStatus = "succeeded"
-	StatusFailed    TaskStatus = "failed"
-	StatusBlocked   TaskStatus = "blocked"
-	StatusCancelled TaskStatus = "cancelled"
+	StatusPending       TaskStatus = "pending"
+	StatusReady         TaskStatus = "ready"
+	StatusRunning       TaskStatus = "running"
+	StatusSucceeded     TaskStatus = "succeeded"
+	StatusFailed        TaskStatus = "failed"
+	StatusBlocked       TaskStatus = "blocked"
+	StatusCancelled     TaskStatus = "cancelled"
+	StatusAwaitingInput TaskStatus = "awaiting_input" // needs human attention
 )
 
 // Plan is a validated DAG of tasks.
@@ -136,17 +137,27 @@ func ReadyTasks(tasks []Task) []Task {
 	return ready
 }
 
-// AllTerminal reports whether every task is succeeded, failed, or cancelled.
+// AllTerminal reports whether every task is in a terminal state.
 func AllTerminal(tasks []Task) bool {
 	for _, t := range tasks {
 		switch t.Status {
-		case StatusSucceeded, StatusFailed, StatusCancelled, StatusBlocked:
+		case StatusSucceeded, StatusFailed, StatusCancelled, StatusBlocked, StatusAwaitingInput:
 			continue
 		default:
 			return false
 		}
 	}
 	return len(tasks) > 0
+}
+
+// NeedsAttention reports whether any task is waiting on the user.
+func NeedsAttention(tasks []Task) bool {
+	for _, t := range tasks {
+		if t.Status == StatusAwaitingInput {
+			return true
+		}
+	}
+	return false
 }
 
 // Succeeded reports whether all tasks succeeded.

@@ -29,8 +29,8 @@ routing:
   strategy: balanced
   preferences:
     architecture: claude
-    implementation: codex
-    frontend: cursor
+    implementation: cursor
+    frontend: codex
     testing: codex
     review: claude
   fallback:

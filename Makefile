@@ -2,7 +2,7 @@ APP=qma
 MODULE=github.com/fernandotonon/QtMesh-Agents
 VERSION?=0.1.0-dev
 
-.PHONY: build test vet run install clean
+.PHONY: build test vet run install clean release-snapshot
 
 build:
 	go build -ldflags "-X $(MODULE)/pkg/version.Version=$(VERSION)" -o bin/$(APP) ./cmd/qma
@@ -37,3 +37,7 @@ install:
 
 clean:
 	rm -rf bin dist
+
+# Build release archives locally without publishing or pushing tags.
+release-snapshot:
+	goreleaser release --snapshot --clean

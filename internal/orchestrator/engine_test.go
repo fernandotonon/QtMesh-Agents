@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,11 +94,28 @@ func TestStartRunWithMock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
+	approved := false
 	for time.Now().Before(deadline) {
 		run, err := store.GetRun(ctx, runID)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if run.Status == orchestrator.RunNeedsAttention && !approved {
+			tasks, _ := store.ListTasksByRun(ctx, runID)
+			for _, task := range tasks {
+				if task.Status != "awaiting_input" {
+					continue
+				}
+				if !strings.HasSuffix(task.ID, "-integrate") && task.Category != "integrate" {
+					continue
+				}
+				if err := eng.ReplyToTask(ctx, runID, task.ID, "Human reply: Approve apply to main working tree.", orchestrator.TaskReplyOpts{}); err != nil {
+					t.Fatalf("approve merge: %v", err)
+				}
+				approved = true
+				break
+			}
 		}
 		if run.Status == orchestrator.RunSucceeded || run.Status == orchestrator.RunFailed || run.Status == orchestrator.RunCancelled {
 			tasks, _ := store.ListTasksByRun(ctx, runID)
@@ -106,6 +124,14 @@ func TestStartRunWithMock(t *testing.T) {
 			}
 			if len(tasks) == 0 {
 				t.Fatal("no tasks persisted")
+			}
+			reviews, _ := store.ListReviewsByRun(ctx, runID)
+			if len(reviews) == 0 {
+				t.Fatal("expected at least one review row after integrate")
+			}
+			readme, _ := os.ReadFile(filepath.Join(repo, "README.md"))
+			if !strings.Contains(string(readme), "qma-mock") {
+				t.Fatalf("expected apply-to-main to land mock README change, got %q", readme)
 			}
 			return
 		}

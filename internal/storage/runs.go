@@ -12,6 +12,7 @@ import (
 type Run struct {
 	ID        string
 	ProjectID string
+	BenchID   string
 	Objective string
 	Status    string
 	Planner   string
@@ -55,12 +56,12 @@ func (s *Store) UpsertRun(ctx context.Context, r Run) error {
 		ended = r.EndedAt.UTC().Format(time.RFC3339)
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO runs(id, project_id, objective, status, planner, work_dir, created_at, updated_at, ended_at, summary, error)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)
+INSERT INTO runs(id, project_id, bench_id, objective, status, planner, work_dir, created_at, updated_at, ended_at, summary, error)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
-  status=excluded.status, planner=excluded.planner, updated_at=excluded.updated_at,
-  ended_at=excluded.ended_at, summary=excluded.summary, error=excluded.error
-`, r.ID, nullStr(r.ProjectID), r.Objective, r.Status, nullStr(r.Planner), nullStr(r.WorkDir),
+  status=excluded.status, planner=excluded.planner, bench_id=COALESCE(excluded.bench_id, runs.bench_id),
+  updated_at=excluded.updated_at, ended_at=excluded.ended_at, summary=excluded.summary, error=excluded.error
+`, r.ID, nullStr(r.ProjectID), nullStr(r.BenchID), r.Objective, r.Status, nullStr(r.Planner), nullStr(r.WorkDir),
 		r.CreatedAt.UTC().Format(time.RFC3339), now, ended, nullStr(r.Summary), nullStr(r.Error))
 	return err
 }
@@ -69,17 +70,18 @@ func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 	var r Run
 	var created, updated string
 	var ended sql.NullString
-	var projectID, planner, workDir, summary, errMsg sql.NullString
+	var projectID, benchID, planner, workDir, summary, errMsg sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, project_id, objective, status, planner, work_dir, created_at, updated_at, ended_at, summary, error
+SELECT id, project_id, bench_id, objective, status, planner, work_dir, created_at, updated_at, ended_at, summary, error
 FROM runs WHERE id=?`, id).Scan(
-		&r.ID, &projectID, &r.Objective, &r.Status, &planner, &workDir,
+		&r.ID, &projectID, &benchID, &r.Objective, &r.Status, &planner, &workDir,
 		&created, &updated, &ended, &summary, &errMsg,
 	)
 	if err != nil {
 		return Run{}, err
 	}
 	r.ProjectID = projectID.String
+	r.BenchID = benchID.String
 	r.Planner = planner.String
 	r.WorkDir = workDir.String
 	r.Summary = summary.String
@@ -98,7 +100,7 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
 		limit = 50
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, COALESCE(project_id,''), objective, status, COALESCE(planner,''), COALESCE(work_dir,''),
+SELECT id, COALESCE(project_id,''), COALESCE(bench_id,''), objective, status, COALESCE(planner,''), COALESCE(work_dir,''),
        created_at, updated_at, ended_at, COALESCE(summary,''), COALESCE(error,'')
 FROM runs ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
@@ -110,7 +112,7 @@ FROM runs ORDER BY created_at DESC LIMIT ?`, limit)
 		var r Run
 		var created, updated string
 		var ended sql.NullString
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Objective, &r.Status, &r.Planner, &r.WorkDir,
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.BenchID, &r.Objective, &r.Status, &r.Planner, &r.WorkDir,
 			&created, &updated, &ended, &r.Summary, &r.Error); err != nil {
 			return nil, err
 		}
@@ -136,10 +138,11 @@ INSERT INTO tasks(id, run_id, project_id, description, category, status, assigne
   max_retries, retry_count, worktree_path, branch, created_at, updated_at, result_json, error, diff_path)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
+  run_id=excluded.run_id, project_id=excluded.project_id,
   status=excluded.status, assigned_agent=excluded.assigned_agent, retry_count=excluded.retry_count,
   worktree_path=excluded.worktree_path, branch=excluded.branch, updated_at=excluded.updated_at,
   result_json=excluded.result_json, error=excluded.error, diff_path=excluded.diff_path,
-  category=excluded.category, description=excluded.description
+  category=excluded.category, description=excluded.description, acceptance_json=excluded.acceptance_json
 `, t.ID, nullStr(t.RunID), nullStr(t.ProjectID), t.Description, nullStr(t.Category), t.Status,
 		nullStr(t.AssignedAgent), string(acc), t.MaxRetries, t.RetryCount,
 		nullStr(t.WorktreePath), nullStr(t.Branch),

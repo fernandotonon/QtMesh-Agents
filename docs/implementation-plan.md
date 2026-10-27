@@ -33,12 +33,16 @@ qma run diff <run-id>
 qma run list
 ```
 
-## Phase 3 — Validation and routing
+## Phase 3 — Validation and routing — Done
 
-- Cross-agent review, verification, merge conflict handling
-- Human approval workflow UI
-- Retry / fallback polish, historical metrics
+- [x] Cross-agent static review (`internal/review.ReviewDiff`) wired into verify/integrate; `reviews` table; conflict/secret blocking
+- [x] Human merge approval (`merge_approval` attention) — Approve apply to main / Reject leave worktree; `qma review list|show`
+- [x] Retry / agent fallback on Detect-fail & empty exit -1; `run_metrics` + `qma metrics`; attention fingerprint cap
+- [x] Reliability: stop worker integration-approval spam; clearer empty exit -1; deterministic integrate (no LLM merge questions)
 
-## Phase 4 — Distribution and polish
+## Phase 4 — Distribution and polish — Done
 
-- First-run wizard, GoReleaser, install scripts, Windows transport polish
+- [x] First-run `qma init` wizard with agent detection, optional project registration, and non-interactive defaults
+- [x] Release/local binary installer with checksum verification
+- [x] GoReleaser version metadata, archives, checksums, release notes, and local snapshot target
+- [x] Windows named-pipe transport; Unix sockets on other platforms

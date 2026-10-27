@@ -33,6 +33,9 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(newProjectCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newChatCmd())
+	root.AddCommand(newAttentionCmd())
+	root.AddCommand(newReviewCmd())
+	root.AddCommand(newMetricsCmd())
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newInitCmd())
 

@@ -88,7 +88,9 @@ func (a *Adapter) Detect(ctx context.Context) (bool, error) {
 		_, err := os.Stat(a.scriptPath)
 		return err == nil, nil
 	}
-	return a.BaseAdapter.Detect(ctx)
+	// Headless Execute is in-process — always available for --agent mock / CI,
+	// even when the optional qma-mock-agent CLI is not on PATH.
+	return true, nil
 }
 
 func (a *Adapter) StartSession(ctx context.Context, opts agents.SessionOptions) (agents.AgentSession, error) {
@@ -118,6 +120,20 @@ func (a *Adapter) StartSession(ctx context.Context, opts agents.SessionOptions) 
 func (a *Adapter) Execute(ctx context.Context, task agents.AgentTask) (agents.Execution, error) {
 	started := time.Now()
 	out := fmt.Sprintf("mock executed: %s", strings.TrimSpace(task.Prompt))
+	// Isolated worktrees: leave a tiny deterministic diff for integrate/review e2e.
+	if task.WorkDir != "" && strings.Contains(task.WorkDir, ".qma-worktrees") {
+		readme := filepath.Join(task.WorkDir, "README.md")
+		if b, err := os.ReadFile(readme); err == nil {
+			if !strings.Contains(string(b), "qma-mock") {
+				_ = os.WriteFile(readme, append(b, []byte("\n<!-- qma-mock -->\n")...), 0o644)
+				out += "\nwrote README.md comment"
+			}
+		} else {
+			path := filepath.Join(task.WorkDir, ".qma-mock-change")
+			_ = os.WriteFile(path, []byte("mock:"+task.ID+"\n"), 0o644)
+			out += "\nwrote .qma-mock-change"
+		}
+	}
 	return agents.Execution{
 		ID:        task.ID,
 		AgentID:   "mock",

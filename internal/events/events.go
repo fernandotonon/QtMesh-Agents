@@ -15,13 +15,16 @@ const (
 	KindSessionStopped   Kind = "session.stopped"
 	KindSessionExited    Kind = "session.exited"
 	KindSessionInterrupted Kind = "session.interrupted"
-	KindTaskQueued       Kind = "task.queued"
-	KindTaskStarted      Kind = "task.started"
-	KindTaskCompleted    Kind = "task.completed"
-	KindTaskFailed       Kind = "task.failed"
-	KindDaemonStarted    Kind = "daemon.started"
-	KindDaemonStopped    Kind = "daemon.stopped"
-	KindError            Kind = "error"
+	KindTaskQueued         Kind = "task.queued"
+	KindTaskStarted        Kind = "task.started"
+	KindTaskCompleted      Kind = "task.completed"
+	KindTaskFailed         Kind = "task.failed"
+	KindAttentionRaised    Kind = "attention.raised"
+	KindAttentionResolved  Kind = "attention.resolved"
+	KindBenchOpened        Kind = "bench.opened"
+	KindDaemonStarted      Kind = "daemon.started"
+	KindDaemonStopped      Kind = "daemon.stopped"
+	KindError              Kind = "error"
 )
 
 // Event is a structured observability record.

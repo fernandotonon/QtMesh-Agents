@@ -33,9 +33,12 @@ type AgentsConfig struct {
 }
 
 type AgentEntry struct {
-	Enabled bool   `yaml:"enabled"`
-	Command string `yaml:"command"`
-	Args    []string `yaml:"args,omitempty"`
+	Enabled        bool     `yaml:"enabled"`
+	Command        string   `yaml:"command"`
+	Args           []string `yaml:"args,omitempty"`
+	Sandbox        string   `yaml:"sandbox,omitempty"`        // codex: read-only|workspace-write|danger-full-access
+	ApproveForMe   bool     `yaml:"approveForMe,omitempty"`   // codex: force approval_policy=never for headless workers
+	PermissionMode string   `yaml:"permissionMode,omitempty"` // claude: acceptEdits|...
 }
 
 type ExecutionConfig struct {
@@ -71,13 +74,13 @@ type DaemonConfig struct {
 func Default() Config {
 	return Config{
 		Orchestrator: OrchestratorConfig{
-			Provider:                "heuristic",
+			Provider:                "cursor", // full orch agent brain; falls back if unavailable
 			MaxPlanningIterations:   5,
 			RequireApprovalForMerge: true,
 		},
 		Agents: AgentsConfig{
-			Claude: AgentEntry{Enabled: true, Command: "claude"},
-			Codex:  AgentEntry{Enabled: true, Command: "codex"},
+			Claude: AgentEntry{Enabled: true, Command: "claude", PermissionMode: "acceptEdits"},
+			Codex:  AgentEntry{Enabled: true, Command: "codex", Sandbox: "workspace-write", ApproveForMe: true},
 			Cursor: AgentEntry{Enabled: true, Command: "cursor-agent"},
 			Mock:   AgentEntry{Enabled: true, Command: "qma-mock-agent"},
 		},
@@ -91,8 +94,9 @@ func Default() Config {
 			Strategy: "balanced",
 			Preferences: map[string]string{
 				"architecture":   "claude",
-				"implementation": "codex",
-				"frontend":       "cursor",
+				"implementation": "cursor",
+				"leadership":     "claude",
+				"frontend":       "codex",
 				"testing":        "codex",
 				"review":         "claude",
 			},

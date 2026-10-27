@@ -1,3 +1,5 @@
+//go:build !unix && !windows
+
 package cli
 
 import "os/exec"

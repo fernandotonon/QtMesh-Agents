@@ -289,11 +289,25 @@ func (c *Client) RunCancel(runID string) error {
 }
 
 func (c *Client) Chat(message string) (ChatResponse, error) {
-	resp, err := c.roundTrip(TypeChat, ChatRequest{Message: message})
+	return c.ChatOpts(ChatRequest{Message: message})
+}
+
+func (c *Client) ChatOpts(req ChatRequest) (ChatResponse, error) {
+	resp, err := c.roundTrip(TypeChat, req)
 	if err != nil {
 		return ChatResponse{}, err
 	}
 	return DecodePayload[ChatResponse](resp.Payload)
+}
+
+func (c *Client) LeaderConsult(projectID, message string) (LeaderConsultResponse, error) {
+	resp, err := c.roundTrip(TypeLeaderConsult, LeaderConsultRequest{
+		Message: message, ProjectID: projectID,
+	})
+	if err != nil {
+		return LeaderConsultResponse{}, err
+	}
+	return DecodePayload[LeaderConsultResponse](resp.Payload)
 }
 
 func (c *Client) ChatHistory() ([]ChatHistoryMessage, error) {
@@ -307,6 +321,36 @@ func (c *Client) ChatHistory() ([]ChatHistoryMessage, error) {
 func (c *Client) ChatClear() error {
 	_, err := c.roundTrip(TypeChatClear, nil)
 	return err
+}
+
+func (c *Client) AttentionList() ([]AttentionInfo, error) {
+	resp, err := c.roundTrip(TypeAttentionList, nil)
+	if err != nil {
+		return nil, err
+	}
+	return DecodePayload[[]AttentionInfo](resp.Payload)
+}
+
+func (c *Client) AttentionResolve(id string) error {
+	_, err := c.roundTrip(TypeAttentionResolve, AttentionRef{ID: id})
+	return err
+}
+
+func (c *Client) TaskReply(runID, taskID, message string) error {
+	return c.TaskReplyOpts(TaskReplyRequest{RunID: runID, TaskID: taskID, Message: message})
+}
+
+func (c *Client) TaskReplyOpts(req TaskReplyRequest) error {
+	_, err := c.roundTrip(TypeTaskReply, req)
+	return err
+}
+
+func (c *Client) BenchList() ([]BenchInfo, error) {
+	resp, err := c.roundTrip(TypeBenchList, nil)
+	if err != nil {
+		return nil, err
+	}
+	return DecodePayload[[]BenchInfo](resp.Payload)
 }
 
 // ReadEnvelope is deprecated; use Outputs().

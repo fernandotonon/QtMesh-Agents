@@ -41,6 +41,7 @@ type Daemon struct {
 	log       *slog.Logger
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+	lockFile  *os.File // exclusive instance lock (unix flock)
 }
 
 // Options configures daemon startup.
@@ -86,7 +87,12 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 
 	reg := agents.NewRegistry()
 	reg.Register(claude.New(cfg.Agents.Claude.Command, cfg.Agents.Claude.Args))
-	reg.Register(codex.New(cfg.Agents.Codex.Command, cfg.Agents.Codex.Args))
+	sandbox := cfg.Agents.Codex.Sandbox
+	if sandbox == "" {
+		sandbox = "workspace-write"
+	}
+	// ApproveForMe defaults on (config.Default sets true) so headless workers don't stall.
+	reg.Register(codex.NewWithOptions(cfg.Agents.Codex.Command, cfg.Agents.Codex.Args, sandbox, cfg.Agents.Codex.ApproveForMe || sandbox == "workspace-write"))
 	reg.Register(cursor.New(cfg.Agents.Cursor.Command, cfg.Agents.Cursor.Args))
 	reg.Register(mock.New(cfg.Agents.Mock.Command, cfg.Agents.Mock.Args))
 
@@ -119,24 +125,38 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 	var chatAdapter agents.AgentAdapter
 	if provider != "" && provider != "heuristic" {
 		if a, ok := reg.Get(provider); ok {
-			chatAdapter = a
+			if det, _ := a.Detect(ctx); det {
+				chatAdapter = a
+			}
 		}
 	}
 	if chatAdapter == nil {
-		// Prefer claude for conversation when available; else any detected provider.
-		for _, id := range []string{"claude", "codex", "cursor"} {
+		// Full orch agent: prefer Cursor, then Claude, then Codex.
+		for _, id := range []string{"cursor", "claude", "codex"} {
 			if a, ok := reg.Get(id); ok {
 				if det, _ := a.Detect(ctx); det {
 					chatAdapter = a
+					opts.Logger.Info("orchestrator agent", "provider", id)
 					break
 				}
 			}
 		}
+	} else {
+		opts.Logger.Info("orchestrator agent", "provider", provider)
 	}
 	conductor := orchestrator.NewConductor(orch, proj, chatAdapter)
 
+	lockFile, err := acquireInstanceLock(socket)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+
 	ln, err := ipc.Listen(socket)
 	if err != nil {
+		if lockFile != nil {
+			_ = lockFile.Close()
+		}
 		_ = store.Close()
 		return nil, fmt.Errorf("listen %s: %w", socket, err)
 	}
@@ -154,6 +174,7 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		ln:        ln,
 		log:       opts.Logger,
 		cancel:    cancel,
+		lockFile:  lockFile,
 	}
 
 	_ = d.recordEvent(runCtx, events.New(events.KindDaemonStarted, "daemon started"))
@@ -164,8 +185,37 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		d.acceptLoop(runCtx)
 	}()
 
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		d.sweepLoop(runCtx)
+	}()
+
 	d.log.Info("daemon listening", "socket", socket, "pid", os.Getpid())
 	return d, nil
+}
+
+// sweepLoop resumes orphaned runs after restart and fails truly stalled live tasks.
+func (d *Daemon) sweepLoop(ctx context.Context) {
+	t := time.NewTicker(45 * time.Second)
+	defer t.Stop()
+	if n, err := d.orch.ResumeOrphanedRuns(ctx); err != nil {
+		d.log.Warn("resume orphans", "err", err)
+	} else if n > 0 {
+		d.log.Info("resumed orphaned runs", "count", n)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n, err := d.orch.SweepStaleTasks(ctx, 20*time.Minute); err != nil {
+				d.log.Warn("sweep", "err", err)
+			} else if n > 0 {
+				d.log.Info("sweep reaped", "count", n)
+			}
+		}
+	}
 }
 
 func (d *Daemon) acceptLoop(ctx context.Context) {
@@ -444,7 +494,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 				d.writeErr(codec, env.ID, err)
 				continue
 			}
-			res, err := d.conductor.Chat(ctx, req.Message)
+			res, err := d.conductor.ChatWith(ctx, req.Message, orchestrator.ChatOpts{ProjectID: req.ProjectID})
 			if err != nil {
 				d.writeErr(codec, env.ID, err)
 				continue
@@ -458,6 +508,33 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			_ = codec.Write(ipc.Envelope{
 				Type: ipc.TypeChatResp, ID: env.ID,
 				Payload: ipc.MustPayload(ipc.ChatResponse{Reply: res.Reply, Actions: actions}),
+			})
+		case ipc.TypeLeaderConsult:
+			req, err := ipc.DecodePayload[ipc.LeaderConsultRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			projs, err := d.projects.List(ctx)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			refs := orchestrator.RefsFromStorage(projs)
+			pid := req.ProjectID
+			if pid == "" && req.BenchID != "" {
+				if b, err := d.store.GetBench(ctx, req.BenchID); err == nil {
+					pid = b.ProjectID
+				}
+			}
+			reply, err := d.conductor.AskLeader(ctx, pid, req.Message, refs)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeLeaderConsultResp, ID: env.ID,
+				Payload: ipc.MustPayload(ipc.LeaderConsultResponse{Reply: reply}),
 			})
 		case ipc.TypeChatHistory:
 			hist := d.conductor.History()
@@ -491,7 +568,8 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			}
 			infos := make([]ipc.RunInfo, 0, len(list))
 			for _, r := range list {
-				infos = append(infos, runToInfo(r, nil))
+				tasks, _ := d.store.ListTasksByRun(ctx, r.ID)
+				infos = append(infos, runToInfo(r, tasks))
 			}
 			_ = codec.Write(ipc.Envelope{Type: ipc.TypeRunListResp, ID: env.ID, Payload: ipc.MustPayload(infos)})
 		case ipc.TypeRunCancel:
@@ -505,6 +583,66 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 				continue
 			}
 			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeAttentionList:
+			list, err := d.orch.ListOpenAttention(ctx)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			infos := make([]ipc.AttentionInfo, 0, len(list))
+			for _, a := range list {
+				infos = append(infos, ipc.AttentionInfo{
+					ID: a.ID, ProjectID: a.ProjectID, BenchID: a.BenchID, RunID: a.RunID,
+					TaskID: a.TaskID, SessionID: a.SessionID, AgentID: a.AgentID,
+					Kind: a.Kind, Message: a.Message, Status: a.Status,
+					CreatedAt: a.CreatedAt.Format(time.RFC3339),
+				})
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeAttentionListResp, ID: env.ID, Payload: ipc.MustPayload(infos)})
+		case ipc.TypeAttentionResolve:
+			req, err := ipc.DecodePayload[ipc.AttentionRef](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.orch.ResolveAttention(ctx, req.ID); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeTaskReply:
+			req, err := ipc.DecodePayload[ipc.TaskReplyRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.orch.ReplyToTask(ctx, req.RunID, req.TaskID, req.Message, orchestrator.TaskReplyOpts{
+				ElevateSandbox:       req.ElevateSandbox,
+				InteractiveApprovals: req.InteractiveApprovals,
+			}); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeBenchList:
+			list, err := d.orch.ListBenches(ctx)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			infos := make([]ipc.BenchInfo, 0, len(list))
+			for _, b := range list {
+				members, _ := d.store.ListBenchMembers(ctx, b.ID)
+				ids := make([]string, 0, len(members))
+				for _, m := range members {
+					ids = append(ids, m.AgentID)
+				}
+				infos = append(infos, ipc.BenchInfo{
+					ID: b.ID, ProjectID: b.ProjectID, Name: b.Name,
+					LeaderAgentID: b.LeaderAgentID, Status: b.Status, Members: ids,
+				})
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeBenchListResp, ID: env.ID, Payload: ipc.MustPayload(infos)})
 		default:
 			d.writeErr(codec, env.ID, fmt.Errorf("unknown type %q", env.Type))
 		}
@@ -569,7 +707,7 @@ func joinProjectNames(refs []orchestrator.ProjectRef) string {
 
 func runToInfo(r storage.Run, tasks []storage.TaskRecord) ipc.RunInfo {
 	info := ipc.RunInfo{
-		ID: r.ID, ProjectID: r.ProjectID, Objective: r.Objective, Status: r.Status,
+		ID: r.ID, ProjectID: r.ProjectID, BenchID: r.BenchID, Objective: r.Objective, Status: r.Status,
 		Planner: r.Planner, WorkDir: r.WorkDir,
 		CreatedAt: r.CreatedAt.Format(time.RFC3339),
 		UpdatedAt: r.UpdatedAt.Format(time.RFC3339),
@@ -583,6 +721,7 @@ func runToInfo(r storage.Run, tasks []storage.TaskRecord) ipc.RunInfo {
 			ID: t.ID, Description: t.Description, Category: t.Category, Status: t.Status,
 			AssignedAgent: t.AssignedAgent, Dependencies: t.Dependencies, Error: t.Error,
 			DiffPath: t.DiffPath, WorktreePath: t.WorktreePath, Branch: t.Branch, RetryCount: t.RetryCount,
+			Output: ipc.ExtractTaskOutput(t.ResultJSON),
 		})
 	}
 	return info
@@ -655,6 +794,10 @@ func (d *Daemon) Stop() {
 		d.log.Warn("shutdown timed out waiting for connections")
 	}
 	_ = d.store.Close()
+	if d.lockFile != nil {
+		_ = d.lockFile.Close()
+		d.lockFile = nil
+	}
 }
 
 // SocketPath returns the listening socket.

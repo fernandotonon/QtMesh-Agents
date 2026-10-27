@@ -22,13 +22,25 @@ builds:
       - -X github.com/fernandotonon/QtMesh-Agents/pkg/version.Date={{.Date}}
 
 archives:
-  - formats: [tar.gz]
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
         formats: [zip]
 
+release:
+  draft: true
+  name_template: "QtMesh Agents {{ .Tag }}"
+  header: |
+    Install with scripts/install.sh, then run `qma init` to set up agents.
+
 checksum:
+  algorithm: sha256
   name_template: checksums.txt
 
 changelog:
   sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

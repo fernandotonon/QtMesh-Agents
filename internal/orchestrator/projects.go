@@ -23,6 +23,11 @@ func refsFromStorage(list []storage.Project) []ProjectRef {
 	return out
 }
 
+// RefsFromStorage exports refsFromStorage for IPC/daemon callers.
+func RefsFromStorage(list []storage.Project) []ProjectRef {
+	return refsFromStorage(list)
+}
+
 // MatchProjects finds projects mentioned in text (name, id, or path basename).
 // Matching requires a word/token boundary so short ids like "a" do not match inside "please".
 func MatchProjects(text string, projects []ProjectRef) []ProjectRef {

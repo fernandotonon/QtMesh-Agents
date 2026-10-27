@@ -2,10 +2,14 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
+
+// ErrNeedsAttention signals the task paused for human input (permissions, approval).
+var ErrNeedsAttention = errors.New("needs attention")
 
 // TaskFunc executes a single task; it should update task.Status and related fields.
 type TaskFunc func(ctx context.Context, task *Task) error
@@ -68,7 +72,8 @@ func RunDAG(ctx context.Context, tasks []Task, maxConcurrent int, fn TaskFunc) e
 		for _, r := range ready {
 			mu.Lock()
 			t := byID[r.ID]
-			if running[t.ID] || t.Status == StatusRunning || t.Status == StatusSucceeded || t.Status == StatusFailed {
+			if running[t.ID] || t.Status == StatusRunning || t.Status == StatusSucceeded ||
+				t.Status == StatusFailed || t.Status == StatusAwaitingInput {
 				mu.Unlock()
 				continue
 			}
@@ -89,14 +94,20 @@ func RunDAG(ctx context.Context, tasks []Task, maxConcurrent int, fn TaskFunc) e
 				mu.Lock()
 				delete(running, tp.ID)
 				if err != nil {
-					if tp.Status != StatusSucceeded {
+					if errors.Is(err, ErrNeedsAttention) || tp.Status == StatusAwaitingInput {
+						tp.Status = StatusAwaitingInput
+						if tp.Error == "" {
+							tp.Error = err.Error()
+						}
+						// Soft: do not treat as hard firstErr so the run can surface needs_attention.
+					} else if tp.Status != StatusSucceeded {
 						tp.Status = StatusFailed
 						if tp.Error == "" {
 							tp.Error = err.Error()
 						}
-					}
-					if firstErr == nil {
-						firstErr = err
+						if firstErr == nil {
+							firstErr = err
+						}
 					}
 				} else if tp.Status == StatusRunning || tp.Status == "" {
 					tp.Status = StatusSucceeded

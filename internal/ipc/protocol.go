@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -41,11 +42,19 @@ const (
 	TypeRunList       = "run_list"
 	TypeRunListResp   = "run_list_resp"
 	TypeRunCancel     = "run_cancel"
-	TypeChat          = "chat"
-	TypeChatResp      = "chat_resp"
-	TypeChatHistory   = "chat_history"
+	TypeChat            = "chat"
+	TypeChatResp        = "chat_resp"
+	TypeChatHistory     = "chat_history"
 	TypeChatHistoryResp = "chat_history_resp"
-	TypeChatClear     = "chat_clear"
+	TypeChatClear       = "chat_clear"
+	TypeLeaderConsult   = "leader_consult"
+	TypeLeaderConsultResp = "leader_consult_resp"
+	TypeAttentionList   = "attention_list"
+	TypeAttentionListResp = "attention_list_resp"
+	TypeAttentionResolve = "attention_resolve"
+	TypeBenchList       = "bench_list"
+	TypeBenchListResp   = "bench_list_resp"
+	TypeTaskReply       = "task_reply"
 )
 
 // Envelope is a length-prefixed JSON message.
@@ -219,6 +228,17 @@ type RunRef struct {
 	RunID string `json:"run_id"`
 }
 
+// TaskReplyRequest sends a human reply to a worker task waiting on input.
+type TaskReplyRequest struct {
+	RunID   string `json:"run_id"`
+	TaskID  string `json:"task_id"`
+	Message string `json:"message"`
+	// ElevateSandbox retries with Codex danger-full-access (grants broader FS access).
+	ElevateSandbox bool `json:"elevate_sandbox,omitempty"`
+	// InteractiveApprovals retries so Codex prompts in the ChatGPT/Codex desktop app.
+	InteractiveApprovals bool `json:"interactive_approvals,omitempty"`
+}
+
 type TaskInfo struct {
 	ID            string   `json:"id"`
 	Description   string   `json:"description"`
@@ -231,11 +251,32 @@ type TaskInfo struct {
 	WorktreePath  string   `json:"worktree_path,omitempty"`
 	Branch        string   `json:"branch,omitempty"`
 	RetryCount    int      `json:"retry_count,omitempty"`
+	// Output is the agent's latest feedback (from result_json), for TUI display.
+	Output string `json:"output,omitempty"`
+}
+
+// ExtractTaskOutput pulls human-readable agent feedback from a task result_json blob.
+func ExtractTaskOutput(resultJSON string) string {
+	resultJSON = strings.TrimSpace(resultJSON)
+	if resultJSON == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(resultJSON), &m); err != nil {
+		return resultJSON
+	}
+	for _, key := range []string{"output", "brief", "summary", "reply"} {
+		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 type RunInfo struct {
 	ID        string     `json:"id"`
 	ProjectID string     `json:"project_id,omitempty"`
+	BenchID   string     `json:"bench_id,omitempty"`
 	Objective string     `json:"objective"`
 	Status    string     `json:"status"`
 	Planner   string     `json:"planner,omitempty"`
@@ -248,8 +289,47 @@ type RunInfo struct {
 	Tasks     []TaskInfo `json:"tasks,omitempty"`
 }
 
+type AttentionInfo struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"project_id,omitempty"`
+	BenchID   string `json:"bench_id,omitempty"`
+	RunID     string `json:"run_id,omitempty"`
+	TaskID    string `json:"task_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	AgentID   string `json:"agent_id,omitempty"`
+	Kind      string `json:"kind"`
+	Message   string `json:"message"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+type AttentionRef struct {
+	ID string `json:"id"`
+}
+
+type BenchInfo struct {
+	ID            string   `json:"id"`
+	ProjectID     string   `json:"project_id"`
+	Name          string   `json:"name"`
+	LeaderAgentID string   `json:"leader_agent_id,omitempty"`
+	Status        string   `json:"status"`
+	Members       []string `json:"members,omitempty"`
+}
+
 type ChatRequest struct {
-	Message string `json:"message"`
+	Message   string `json:"message"`
+	ProjectID string `json:"project_id,omitempty"` // TUI tree focus
+}
+
+// LeaderConsultRequest asks the project bench leader a one-shot question.
+type LeaderConsultRequest struct {
+	Message   string `json:"message"`
+	ProjectID string `json:"project_id,omitempty"`
+	BenchID   string `json:"bench_id,omitempty"`
+}
+
+type LeaderConsultResponse struct {
+	Reply string `json:"reply"`
 }
 
 type ChatActionInfo struct {

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,12 +19,13 @@ import (
 )
 
 const (
-	RunPending   = "pending"
-	RunPlanning  = "planning"
-	RunRunning   = "running"
-	RunSucceeded = "succeeded"
-	RunFailed    = "failed"
-	RunCancelled = "cancelled"
+	RunPending         = "pending"
+	RunPlanning        = "planning"
+	RunRunning         = "running"
+	RunSucceeded       = "succeeded"
+	RunFailed          = "failed"
+	RunCancelled       = "cancelled"
+	RunNeedsAttention  = "needs_attention"
 )
 
 // PlanRequest is a natural-language objective.
@@ -45,6 +47,7 @@ type Engine struct {
 	mu       sync.Mutex
 	cancels  map[string]context.CancelFunc
 	running  map[string]bool
+	procs    *procTracker
 }
 
 // Dependencies for constructing an Engine.
@@ -73,6 +76,7 @@ func New(deps Deps) *Engine {
 		log:      log,
 		cancels:  map[string]context.CancelFunc{},
 		running:  map[string]bool{},
+		procs:    newProcTracker(),
 	}
 }
 
@@ -118,6 +122,11 @@ func (e *Engine) assignAgents(ctx context.Context, plan scheduler.Plan) schedule
 		if t.AssignedAgent != "" {
 			continue
 		}
+		// Leadership is executed locally — no vendor seat required.
+		if t.Category == "leadership" || strings.HasSuffix(t.ID, "lead") {
+			t.AssignedAgent = "local-leader"
+			continue
+		}
 		cat := t.Category
 		if cat == "" {
 			cat = "implementation"
@@ -161,9 +170,22 @@ func (e *Engine) StartRun(ctx context.Context, req PlanRequest) (string, error) 
 
 	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
 	now := time.Now().UTC()
+
+	var benchID string
+	if req.ProjectID != "" {
+		workers := []string{}
+		if req.AgentOverride != "" {
+			workers = append(workers, req.AgentOverride)
+		}
+		if b, berr := e.EnsureBench(ctx, req.ProjectID, req.ProjectID, workers); berr == nil {
+			benchID = b.ID
+		}
+	}
+
 	run := storage.Run{
 		ID:        runID,
 		ProjectID: req.ProjectID,
+		BenchID:   benchID,
 		Objective: req.Objective,
 		Status:    RunPlanning,
 		Planner:   e.planner.Name(),
@@ -185,6 +207,7 @@ func (e *Engine) StartRun(ctx context.Context, req PlanRequest) (string, error) 
 		_ = e.store.UpsertRun(ctx, run)
 		return runID, err
 	}
+	plan = uniquifyTaskIDs(runID, plan)
 
 	for _, t := range plan.Tasks {
 		rec := taskToRecord(runID, t)
@@ -193,32 +216,362 @@ func (e *Engine) StartRun(ctx context.Context, req PlanRequest) (string, error) 
 		}
 	}
 
-	run.Status = RunRunning
-	run.UpdatedAt = time.Now().UTC()
-	if err := e.store.UpsertRun(ctx, run); err != nil {
-		return runID, err
-	}
-
 	runCtx, cancel := context.WithCancel(context.Background())
+	// Register as live BEFORE persisting "running" so a concurrent resume/sweep
+	// cannot treat this run as an orphan mid-start.
 	e.mu.Lock()
 	e.cancels[runID] = cancel
 	e.running[runID] = true
 	e.mu.Unlock()
 
+	run.Status = RunRunning
+	run.UpdatedAt = time.Now().UTC()
+	if err := e.store.UpsertRun(ctx, run); err != nil {
+		cancel()
+		e.mu.Lock()
+		delete(e.cancels, runID)
+		delete(e.running, runID)
+		e.mu.Unlock()
+		return runID, err
+	}
+
 	go e.executeRun(runCtx, runID, req, plan)
 	return runID, nil
 }
 
-// CancelRun cancels a running orchestration.
+// CancelRun cancels a running orchestration. Always updates storage and reaps
+// leftover worker processes matching the run id (even after daemon restart).
 func (e *Engine) CancelRun(runID string) error {
 	e.mu.Lock()
 	cancel, ok := e.cancels[runID]
 	e.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("run %q not active", runID)
+	if ok {
+		cancel()
 	}
-	cancel()
+	if e.procs != nil {
+		e.procs.killRun(runID)
+	}
+	// Best-effort: kill orphaned vendor CLIs still carrying this run id.
+	killOrphanWorkers(runID)
+
+	ctx := context.Background()
+	run, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		if ok {
+			return nil // cancel signaled even if store lookup failed
+		}
+		return fmt.Errorf("run %q not found: %w", runID, err)
+	}
+	switch run.Status {
+	case RunSucceeded, RunFailed, RunCancelled:
+		return nil
+	}
+	ended := time.Now().UTC()
+	run.Status = RunCancelled
+	if ok {
+		run.Error = "cancelled"
+	} else {
+		run.Error = "cancelled (orphaned — no active executor)"
+	}
+	run.EndedAt = &ended
+	run.UpdatedAt = ended
+	if err := e.store.UpsertRun(ctx, run); err != nil {
+		return err
+	}
+	tasks, _ := e.store.ListTasksByRun(ctx, runID)
+	for _, t := range tasks {
+		switch t.Status {
+		case "running", "pending", "ready", "awaiting_input":
+			t.Status = "cancelled"
+			t.Error = "cancelled"
+			t.UpdatedAt = ended
+			_ = e.store.UpsertTask(ctx, t)
+		}
+	}
 	return nil
+}
+
+// TaskReplyOpts controls how a paused task is resumed after a human reply.
+type TaskReplyOpts struct {
+	ElevateSandbox       bool
+	InteractiveApprovals bool
+}
+
+// ReplyToTask records a human reply for a task waiting on input and resumes the run.
+func (e *Engine) ReplyToTask(ctx context.Context, runID, taskID, reply string, opts TaskReplyOpts) error {
+	reply = strings.TrimSpace(reply)
+	if runID == "" || taskID == "" || reply == "" {
+		return fmt.Errorf("run_id, task_id, and reply are required")
+	}
+	run, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	task, err := e.store.GetTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.RunID != "" && task.RunID != runID {
+		return fmt.Errorf("task %q does not belong to run %q", taskID, runID)
+	}
+	switch task.Status {
+	case "awaiting_input", "failed":
+	default:
+		return fmt.Errorf("task %q is %s (expected awaiting_input)", taskID, task.Status)
+	}
+
+	now := time.Now().UTC()
+	task.ResultJSON = mergeHumanReply(task.ResultJSON, reply, opts)
+	task.Status = "pending"
+	task.Error = ""
+	task.UpdatedAt = now
+	if err := e.store.UpsertTask(ctx, task); err != nil {
+		return err
+	}
+
+	// Resolve open attention marks for this task/run (also heals bench ⚠ status).
+	open, _ := e.store.ListOpenAttention(ctx)
+	for _, a := range open {
+		if a.RunID == runID && (a.TaskID == "" || a.TaskID == taskID) {
+			_ = e.ResolveAttention(ctx, a.ID)
+		}
+	}
+	// Ensure bench is not left needs_attention after replies cleared the marks.
+	_ = e.healBenchAttention(ctx, run.ProjectID, "")
+
+	e.mu.Lock()
+	already := e.running[runID]
+	e.mu.Unlock()
+	if already {
+		return fmt.Errorf("run %s is still executing — wait until it pauses on ⚠, then reply", runID)
+	}
+
+	run.Status = RunRunning
+	run.Error = ""
+	run.UpdatedAt = now
+	run.EndedAt = nil
+	_ = e.store.UpsertRun(ctx, run)
+	return e.resumeAfterReply(ctx, runID, taskID, reply, opts)
+}
+
+func (e *Engine) resumeAfterReply(ctx context.Context, runID, taskID, reply string, opts TaskReplyOpts) error {
+	r, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	recs, err := e.store.ListTasksByRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	tasks := make([]scheduler.Task, 0, len(recs))
+	for _, rec := range recs {
+		st := scheduler.TaskStatus(rec.Status)
+		if rec.ID == taskID {
+			st = scheduler.StatusPending
+			rec.Status = string(st)
+			rec.ResultJSON = mergeHumanReply(rec.ResultJSON, reply, opts)
+			rec.Error = ""
+			rec.UpdatedAt = now
+			_ = e.store.UpsertTask(ctx, rec)
+		} else if st == scheduler.StatusAwaitingInput {
+			// Other paused tasks stay pending so the DAG can continue after this reply.
+			st = scheduler.StatusPending
+			rec.Status = string(st)
+			rec.Error = "resumed after human reply"
+			rec.UpdatedAt = now
+			_ = e.store.UpsertTask(ctx, rec)
+		}
+		tasks = append(tasks, scheduler.Task{
+			ID: rec.ID, Description: rec.Description, Category: rec.Category,
+			Dependencies: rec.Dependencies, AssignedAgent: rec.AssignedAgent,
+			Status: st, Acceptance: rec.Acceptance, MaxRetries: rec.MaxRetries,
+			RetryCount: rec.RetryCount, ProjectID: rec.ProjectID, RunID: r.ID,
+			WorktreePath: rec.WorktreePath, Branch: rec.Branch,
+			Error: rec.Error, DiffPath: rec.DiffPath, ResultJSON: rec.ResultJSON,
+		})
+	}
+
+	r.Status = RunRunning
+	r.Error = ""
+	r.UpdatedAt = now
+	r.EndedAt = nil
+	_ = e.store.UpsertRun(ctx, r)
+
+	req := PlanRequest{Objective: r.Objective, ProjectID: r.ProjectID, WorkDir: r.WorkDir}
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.cancels[runID] = cancel
+	e.running[runID] = true
+	e.mu.Unlock()
+	e.log.Info("resuming run after human reply", "run", runID, "task", taskID)
+	go e.executeRun(runCtx, runID, req, scheduler.Plan{Tasks: tasks})
+	return nil
+}
+
+// ResumeOrphanedRuns re-attaches executors for runs left "running" after a daemon restart.
+// Interrupted in-flight tasks are reset to pending so the DAG can continue.
+func (e *Engine) ResumeOrphanedRuns(ctx context.Context) (int, error) {
+	list, err := e.store.ListRuns(ctx, 50)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range list {
+		switch r.Status {
+		case RunRunning, RunPlanning, RunNeedsAttention:
+		default:
+			continue
+		}
+		e.mu.Lock()
+		already := e.running[r.ID]
+		e.mu.Unlock()
+		if already {
+			continue
+		}
+		if err := e.resumeRun(ctx, r); err != nil {
+			e.log.Warn("resume run", "run", r.ID, "err", err)
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+func (e *Engine) resumeRun(ctx context.Context, r storage.Run) error {
+	recs, err := e.store.ListTasksByRun(ctx, r.ID)
+	if err != nil {
+		return err
+	}
+	if len(recs) == 0 {
+		return fmt.Errorf("no tasks")
+	}
+	now := time.Now().UTC()
+	// Skip brand-new runs — another StartRun may still be wiring the executor.
+	if now.Sub(r.UpdatedAt) < 15*time.Second {
+		return fmt.Errorf("too fresh to resume")
+	}
+	tasks := make([]scheduler.Task, 0, len(recs))
+	for _, rec := range recs {
+		st := scheduler.TaskStatus(rec.Status)
+		switch st {
+		case scheduler.StatusAwaitingInput:
+			// Keep paused — human must reply (auth / permission). Do not wipe the stall.
+		case scheduler.StatusRunning:
+			// Interrupted mid-flight — retry.
+			st = scheduler.StatusPending
+			rec.Status = string(st)
+			rec.Error = "resumed after daemon restart"
+			rec.UpdatedAt = now
+			_ = e.store.UpsertTask(ctx, rec)
+		case scheduler.StatusCancelled:
+			// Keep cancelled — user/sweep stopped this task.
+		}
+		tasks = append(tasks, scheduler.Task{
+			ID: rec.ID, Description: rec.Description, Category: rec.Category,
+			Dependencies: rec.Dependencies, AssignedAgent: rec.AssignedAgent,
+			Status: st, Acceptance: rec.Acceptance, MaxRetries: rec.MaxRetries,
+			RetryCount: rec.RetryCount, ProjectID: rec.ProjectID, RunID: r.ID,
+			WorktreePath: rec.WorktreePath, Branch: rec.Branch,
+			Error: rec.Error, DiffPath: rec.DiffPath, ResultJSON: rec.ResultJSON,
+		})
+	}
+	// If everything is already terminal, just reconcile run status.
+	if scheduler.AllTerminal(tasks) {
+		return nil
+	}
+	r.Status = RunRunning
+	r.Error = ""
+	r.UpdatedAt = now
+	r.EndedAt = nil
+	_ = e.store.UpsertRun(ctx, r)
+
+	req := PlanRequest{
+		Objective: r.Objective,
+		ProjectID: r.ProjectID,
+		WorkDir:   r.WorkDir,
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.cancels[r.ID] = cancel
+	e.running[r.ID] = true
+	e.mu.Unlock()
+	e.log.Info("resuming orphaned run", "run", r.ID)
+	go e.executeRun(runCtx, r.ID, req, scheduler.Plan{Tasks: tasks})
+	return nil
+}
+
+// SweepStaleTasks fails tasks that have been "running" too long under a live executor.
+func (e *Engine) SweepStaleTasks(ctx context.Context, maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		maxAge = 25 * time.Minute
+	}
+	list, err := e.store.ListRuns(ctx, 50)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	now := time.Now().UTC()
+	e.mu.Lock()
+	live := make(map[string]bool, len(e.running))
+	for id := range e.running {
+		live[id] = true
+	}
+	e.mu.Unlock()
+
+	for _, r := range list {
+		if !live[r.ID] {
+			continue
+		}
+		tasks, err := e.store.ListTasksByRun(ctx, r.ID)
+		if err != nil {
+			continue
+		}
+		for _, t := range tasks {
+			if t.Status != "running" {
+				continue
+			}
+			if now.Sub(t.UpdatedAt) < maxAge {
+				continue
+			}
+			t.Status = "failed"
+			t.Error = fmt.Sprintf("stale: running longer than %s without completion", maxAge)
+			t.UpdatedAt = now
+			_ = e.store.UpsertTask(ctx, t)
+			n++
+			_ = e.RaiseAttention(ctx, storage.Attention{
+				ProjectID: r.ProjectID, BenchID: r.BenchID, RunID: r.ID, TaskID: t.ID,
+				AgentID: t.AssignedAgent, Kind: "stalled",
+				Message: fmt.Sprintf("Task %s stalled — marked failed after %s", t.ID, maxAge),
+				Status:  "open",
+			})
+		}
+	}
+	return n, nil
+}
+
+// CancelActiveRunsForProject cancels every non-terminal run for a project.
+// Used when the user asks to continue/supersede work so agents are not piled up.
+func (e *Engine) CancelActiveRunsForProject(ctx context.Context, projectID string) ([]string, error) {
+	list, err := e.store.ListRuns(ctx, 50)
+	if err != nil {
+		return nil, err
+	}
+	var cancelled []string
+	for _, r := range list {
+		if projectID != "" && r.ProjectID != projectID {
+			continue
+		}
+		switch r.Status {
+		case RunPending, RunPlanning, RunRunning:
+			if err := e.CancelRun(r.ID); err != nil {
+				e.log.Warn("cancel run", "run", r.ID, "err", err)
+				continue
+			}
+			cancelled = append(cancelled, r.ID)
+		}
+	}
+	return cancelled, nil
 }
 
 func (e *Engine) executeRun(ctx context.Context, runID string, req PlanRequest, plan scheduler.Plan) {
@@ -238,6 +591,7 @@ func (e *Engine) executeRun(ctx context.Context, runID string, req PlanRequest, 
 		timeout = 30 * time.Minute
 	}
 
+	benchID, _ := e.store.GetRunBenchID(context.Background(), runID)
 	exec := &Executor{
 		Registry:        e.registry,
 		Store:           e.store,
@@ -247,7 +601,16 @@ func (e *Engine) executeRun(ctx context.Context, runID string, req PlanRequest, 
 		Timeout:         timeout,
 		MaxRetries:      e.cfg.Execution.MaxRetries,
 		RequireApproval: e.cfg.Orchestrator.RequireApprovalForMerge,
+		RaiseAttention:  e.RaiseAttention,
+		ProjectID:       req.ProjectID,
+		BenchID:         benchID,
 		Emit:            e.emit,
+	}
+	if req.AgentOverride != "" {
+		// Honor forced agent — do not silently hop to another vendor mid-run.
+		exec.SetFallbackAgents(nil)
+	} else {
+		exec.SetFallbackAgents(e.cfg.Routing.Fallback)
 	}
 
 	err := scheduler.RunDAG(ctx, plan.Tasks, maxConc, func(ctx context.Context, task *scheduler.Task) error {
@@ -274,6 +637,16 @@ func (e *Engine) executeRun(ctx context.Context, runID string, req PlanRequest, 
 		run.Status = RunCancelled
 		run.Error = "cancelled"
 		run.Summary = summarizeTasks(tasks)
+	} else if anyAwaitingInput(tasks) {
+		run.Status = RunNeedsAttention
+		run.Error = "one or more tasks need your attention"
+		run.Summary = summarizeTasks(tasks)
+		_ = e.RaiseAttention(bg, storage.Attention{
+			ProjectID: run.ProjectID, BenchID: run.BenchID, RunID: runID,
+			Kind: "permission", Message: "Run paused — open the tree (⚠) and resolve attention marks.",
+			Status: "open", AgentID: firstAwaitingAgent(tasks),
+			TaskID: firstAwaitingTask(tasks),
+		})
 	} else if err != nil {
 		run.Status = RunFailed
 		run.Error = err.Error()
@@ -281,16 +654,39 @@ func (e *Engine) executeRun(ctx context.Context, runID string, req PlanRequest, 
 	} else if allSucceeded(tasks) {
 		run.Status = RunSucceeded
 		run.Summary = summarizeTasks(tasks)
-		if e.cfg.Orchestrator.RequireApprovalForMerge {
-			run.Summary += "\nMerge not performed — approval required."
-		}
+		// Integrate already raised merge_approval (and applied on approve). Do not re-raise.
 	} else {
 		run.Status = RunFailed
 		run.Summary = summarizeTasks(tasks)
 		run.Error = "one or more tasks failed"
 	}
 	_ = e.store.UpsertRun(bg, run)
+	_ = e.persistRunMetric(bg, run, tasks)
 	_ = e.emit(bg, events.KindTaskCompleted, runID, "", "", "run finished: "+run.Status)
+}
+
+func (e *Engine) persistRunMetric(ctx context.Context, run storage.Run, tasks []storage.TaskRecord) error {
+	var retries int
+	agent := ""
+	for _, t := range tasks {
+		retries += t.RetryCount
+		if agent == "" && t.AssignedAgent != "" && t.AssignedAgent != "local-leader" {
+			agent = t.AssignedAgent
+		}
+	}
+	dur := int64(0)
+	if run.EndedAt != nil && !run.CreatedAt.IsZero() {
+		dur = run.EndedAt.Sub(run.CreatedAt).Milliseconds()
+	}
+	return e.store.UpsertRunMetric(ctx, storage.RunMetric{
+		ID:         "met-" + run.ID,
+		RunID:      run.ID,
+		ProjectID:  run.ProjectID,
+		AgentID:    agent,
+		DurationMS: dur,
+		Retries:    retries,
+		Success:    run.Status == RunSucceeded,
+	})
 }
 
 func (e *Engine) emit(ctx context.Context, kind events.Kind, runID, taskID, agentID, msg string) error {
@@ -301,6 +697,33 @@ func (e *Engine) emit(ctx context.Context, kind events.Kind, runID, taskID, agen
 	ev.Data["run_id"] = runID
 	return e.store.InsertEvent(ctx, ev.ID, string(ev.Kind), ev.Timestamp.Format(time.RFC3339),
 		"", "", agentID, taskID, msg, fmt.Sprintf(`{"run_id":%q}`, runID))
+}
+
+// uniquifyTaskIDs prefixes task IDs with the run ID so concurrent/sequential
+// runs do not collide in SQLite (task id is the primary key).
+func uniquifyTaskIDs(runID string, plan scheduler.Plan) scheduler.Plan {
+	idMap := make(map[string]string, len(plan.Tasks))
+	for _, t := range plan.Tasks {
+		if strings.HasPrefix(t.ID, runID+"-") {
+			idMap[t.ID] = t.ID
+			continue
+		}
+		idMap[t.ID] = runID + "-" + t.ID
+	}
+	for i := range plan.Tasks {
+		t := &plan.Tasks[i]
+		t.ID = idMap[t.ID]
+		deps := make([]string, len(t.Dependencies))
+		for j, d := range t.Dependencies {
+			if neu, ok := idMap[d]; ok {
+				deps[j] = neu
+			} else {
+				deps[j] = d
+			}
+		}
+		t.Dependencies = deps
+	}
+	return plan
 }
 
 func taskToRecord(runID string, t scheduler.Task) storage.TaskRecord {
@@ -351,6 +774,33 @@ func allSucceeded(tasks []storage.TaskRecord) bool {
 		}
 	}
 	return true
+}
+
+func anyAwaitingInput(tasks []storage.TaskRecord) bool {
+	for _, t := range tasks {
+		if t.Status == string(scheduler.StatusAwaitingInput) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstAwaitingTask(tasks []storage.TaskRecord) string {
+	for _, t := range tasks {
+		if t.Status == string(scheduler.StatusAwaitingInput) {
+			return t.ID
+		}
+	}
+	return ""
+}
+
+func firstAwaitingAgent(tasks []storage.TaskRecord) string {
+	for _, t := range tasks {
+		if t.Status == string(scheduler.StatusAwaitingInput) {
+			return t.AssignedAgent
+		}
+	}
+	return ""
 }
 
 // DiffDir returns the directory where task diffs are stored.

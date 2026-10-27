@@ -46,8 +46,13 @@ func (a *Adapter) StartSession(ctx context.Context, opts agents.SessionOptions) 
 
 // Execute runs a headless Claude prompt.
 // Uses `claude -p` for print/headless mode when available.
+// acceptEdits lets orchestration workers apply file changes without interactive prompts.
 func (a *Adapter) Execute(ctx context.Context, task agents.AgentTask) (agents.Execution, error) {
-	args := []string{"-p", task.Prompt, "--output-format", "text"}
+	args := []string{
+		"-p", task.Prompt,
+		"--output-format", "text",
+		"--permission-mode", "acceptEdits",
+	}
 	args = append(args, task.ExtraArgs...)
 	return a.RunHeadless(ctx, task, args)
 }

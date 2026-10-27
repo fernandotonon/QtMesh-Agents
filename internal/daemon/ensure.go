@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fernandotonon/QtMesh-Agents/internal/ipc"
@@ -19,8 +21,12 @@ func EnsureRunning(socketPath string) error {
 			return err
 		}
 	}
-	if ipc.IsDaemonAlive(socketPath) {
-		return nil
+	// Retry the alive probe — a single timeout under load used to spawn duplicates.
+	for i := 0; i < 3; i++ {
+		if ipc.IsDaemonAlive(socketPath) {
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -36,12 +42,16 @@ func EnsureRunning(socketPath string) error {
 	// Detach.
 	_ = cmd.Process.Release()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if ipc.IsDaemonAlive(socketPath) {
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
+	}
+	// If another process won the lock/listen race, treat as success when alive now.
+	if ipc.IsDaemonAlive(socketPath) {
+		return nil
 	}
 	return fmt.Errorf("daemon did not become ready at %s", socketPath)
 }
@@ -59,4 +69,21 @@ func WritePid(socketPath string) error {
 // RemovePid removes the pid file.
 func RemovePid(socketPath string) {
 	_ = os.Remove(PidFilePath(socketPath))
+}
+
+// ForceCleanup stops leftover daemon processes and removes stale socket/pid files.
+func ForceCleanup(socketPath string) {
+	if b, err := os.ReadFile(PidFilePath(socketPath)); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
+			proc, err := os.FindProcess(pid)
+			if err == nil {
+				_ = proc.Kill()
+			}
+		}
+	}
+	_ = exec.Command("pkill", "-f", "qma daemon start").Run()
+	_ = os.Remove(socketPath)
+	RemovePid(socketPath)
+	// Give the OS a moment to release the socket path.
+	time.Sleep(200 * time.Millisecond)
 }

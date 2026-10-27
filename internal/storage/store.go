@@ -242,6 +242,21 @@ func (s *Store) GetSession(ctx context.Context, id string) (SessionRecord, error
 	return SessionRecord{}, fmt.Errorf("session %q not found", id)
 }
 
+// DeleteSession removes a session row (used to prune dead interactive PTYs).
+func (s *Store) DeleteSession(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, id)
+	return err
+}
+
+// DeleteNonRunningSessions removes stopped/exited/interrupted session rows.
+func (s *Store) DeleteNonRunningSessions(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE status != 'running'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // --- Events ---
 
 func (s *Store) InsertEvent(ctx context.Context, id, kind, ts, sessionID, projectID, agentID, taskID, message, dataJSON string) error {

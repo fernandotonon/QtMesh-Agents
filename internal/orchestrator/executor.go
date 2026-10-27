@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fernandotonon/QtMesh-Agents/internal/agents"
@@ -29,7 +31,14 @@ type Executor struct {
 	Timeout         time.Duration
 	MaxRetries      int
 	RequireApproval bool
+	RaiseAttention  func(ctx context.Context, a storage.Attention) error
+	ProjectID       string
+	BenchID         string
 	Emit            func(ctx context.Context, kind events.Kind, runID, taskID, agentID, msg string) error
+
+	fallbackAgents []string
+	attnFP         map[string]int
+	muFB           sync.Mutex
 }
 
 func (e *Executor) RunTask(ctx context.Context, runID string, req PlanRequest, task *scheduler.Task) error {
@@ -59,6 +68,16 @@ func (e *Executor) RunTask(ctx context.Context, runID string, req PlanRequest, t
 			_ = e.persist(ctx, runID, task)
 			return nil
 		}
+		// Don't retry permission / human-input stalls — surface attention instead.
+		if task.Status == scheduler.StatusAwaitingInput ||
+			(lastErr != nil && strings.Contains(lastErr.Error(), "needs attention")) {
+			_ = e.persist(ctx, runID, task)
+			return lastErr
+		}
+		// Empty exit -1: try next fallback agent once before failing hard.
+		if isEmptyExitRetryable(lastErr) && attempt < maxRetries {
+			e.tryFallbackAgent(task)
+		}
 		task.Error = lastErr.Error()
 		_ = e.persist(ctx, runID, task)
 		if attempt < maxRetries {
@@ -72,11 +91,12 @@ func (e *Executor) RunTask(ctx context.Context, runID string, req PlanRequest, t
 
 func shouldIsolate(task *scheduler.Task) bool {
 	switch task.Category {
-	case "architecture", "review":
+	case "architecture", "review", "leadership":
 		return false
 	}
 	id := strings.ToLower(task.ID)
-	if strings.HasPrefix(id, "discover") || strings.HasPrefix(id, "integrate") || strings.HasPrefix(id, "review") {
+	if strings.Contains(id, "discover") || strings.Contains(id, "integrate") ||
+		strings.Contains(id, "review") || strings.HasSuffix(id, "lead") {
 		return false
 	}
 	return true
@@ -107,32 +127,147 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 		workDir = dir
 	}
 
+	// Leadership is local and instant — avoids hanging the whole bench on a slow LLM.
+	if isLeadershipTask(task) {
+		if err := runLocalLead(ctx, req, task); err != nil {
+			return err
+		}
+		task.AssignedAgent = "local-leader"
+		if e.Emit != nil {
+			_ = e.Emit(ctx, events.KindTaskCompleted, runID, task.ID, "local-leader", "local leader brief ready")
+		}
+		return nil
+	}
+
+	// Integrate is deterministic: collect diffs, static review, raise merge_approval.
+	if isIntegrateTask(task) {
+		return e.runIntegrate(ctx, runID, req, task)
+	}
+
 	if e.Registry == nil {
 		return fmt.Errorf("agent registry not configured")
 	}
 	if task.AssignedAgent == "" {
 		return fmt.Errorf("task %q has no assigned agent", task.ID)
 	}
-	adapter, err := e.Registry.Require(task.AssignedAgent)
+	adapter, err := e.pickAdapter(ctx, task)
 	if err != nil {
 		return err
 	}
 
 	prompt := buildTaskPrompt(req, task, workDir)
-	tctx := ctx
-	cancel := func() {}
-	if e.Timeout > 0 {
-		tctx, cancel = context.WithTimeout(ctx, e.Timeout)
+	timeout := e.Timeout
+	// Keep worker tasks bounded; default 30m is fine, but prefer a tighter cap when unset.
+	if timeout <= 0 {
+		timeout = 20 * time.Minute
 	}
+	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	var (
+		attentionMsg   string
+		attentionMu    sync.Mutex
+		lastOutUnix    atomic.Int64
+		lastPersistUnix atomic.Int64
+		raisedLive     atomic.Bool
+		lastFullMu     sync.Mutex
+		lastFull       string
+	)
+	lastOutUnix.Store(time.Now().Unix())
+	lastPersistUnix.Store(0)
+	raiseLiveAttention := func(msg string) {
+		if !raisedLive.CompareAndSwap(false, true) {
+			return
+		}
+		attentionMu.Lock()
+		if attentionMsg == "" {
+			attentionMsg = msg
+		}
+		attentionMu.Unlock()
+		task.Status = scheduler.StatusAwaitingInput
+		task.Error = msg
+		_ = e.persist(context.Background(), runID, task)
+		e.log().Warn("agent needs attention mid-run", "task", task.ID, "agent", task.AssignedAgent, "msg", msg)
+		if e.RaiseAttention != nil && e.shouldRaiseFingerprint(runID, task.ID, msg) {
+			_ = e.RaiseAttention(context.Background(), storage.Attention{
+				ProjectID: e.ProjectID,
+				BenchID:   e.BenchID,
+				RunID:     runID,
+				TaskID:    task.ID,
+				AgentID:   task.AssignedAgent,
+				Kind:      "permission",
+				Message:   fmt.Sprintf("%s (task %s / agent %s)", msg, shortID(task.ID), task.AssignedAgent),
+				Status:    "open",
+			})
+		}
+		cancel()
+	}
+	getAttention := func() string {
+		attentionMu.Lock()
+		defer attentionMu.Unlock()
+		return attentionMsg
+	}
+
+	// Idle watchdog: if output stalls under interactive approval, raise ⚠ in ~90s
+	// instead of waiting for the full task timeout.
+	stopWatch := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-tctx.Done():
+				return
+			case <-ticker.C:
+				idleFor := time.Since(time.Unix(lastOutUnix.Load(), 0))
+				if idleFor < 90*time.Second {
+					continue
+				}
+				lastFullMu.Lock()
+				snap := lastFull
+				lastFullMu.Unlock()
+				if needs, msg := looksLikeIdleApprovalStall(snap); needs {
+					raiseLiveAttention(msg)
+				}
+			}
+		}
+	}()
+
+	elevate, interactive := permissionFlagsFromResult(task.ResultJSON)
 	execRes, err := adapter.Execute(tctx, agents.AgentTask{
-		ID:          runID + "-" + task.ID,
-		Description: task.Description,
-		WorkDir:     workDir,
-		Prompt:      prompt,
-		Timeout:     e.Timeout,
+		ID:                   runID + "-" + task.ID,
+		Description:          task.Description,
+		WorkDir:              workDir,
+		Prompt:               prompt,
+		Timeout:              timeout,
+		ElevatedSandbox:      elevate,
+		InteractiveApprovals: interactive,
+		OnOutput: func(_, full string) {
+			now := time.Now().Unix()
+			lastOutUnix.Store(now)
+			lastFullMu.Lock()
+			lastFull = full
+			lastFullMu.Unlock()
+			// Persist live feedback every ~2s so the TUI can show agent progress.
+			if now-lastPersistUnix.Load() >= 2 {
+				lastPersistUnix.Store(now)
+				raw, _ := json.Marshal(map[string]any{
+					"agent":    task.AssignedAgent,
+					"output":   trimOut(full),
+					"live":     true,
+					"work_dir": workDir,
+				})
+				task.ResultJSON = string(raw)
+				_ = e.persist(context.Background(), runID, task)
+			}
+			if needs, msg := looksLikeNeedsAttention(full, 0); needs {
+				raiseLiveAttention(msg)
+			}
+		},
 	})
+	close(stopWatch)
 
 	result := map[string]any{
 		"exit_code": execRes.ExitCode,
@@ -160,22 +295,91 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 		}
 	}
 
+	if msg := getAttention(); msg != "" {
+		return e.pauseForAttention(ctx, runID, task, msg)
+	}
 	if err != nil {
-		return err
+		if needs, msg := looksLikeNeedsAttention(err.Error()+"\n"+execRes.Output, execRes.ExitCode); needs {
+			return e.pauseForAttention(ctx, runID, task, msg)
+		}
+		// Context cancel with on-request banner still means the human was needed.
+		if needs, msg := looksLikeIdleApprovalStall(execRes.Output); needs {
+			return e.pauseForAttention(ctx, runID, task, msg)
+		}
+		return classifyAgentFailure(err, execRes.ExitCode, execRes.Output, tctx.Err())
 	}
 	if execRes.ExitCode != 0 {
-		return fmt.Errorf("agent exit %d: %s", execRes.ExitCode, trimOut(execRes.Output))
+		out := trimOut(execRes.Output)
+		if needs, msg := looksLikeNeedsAttention(out, execRes.ExitCode); needs {
+			return e.pauseForAttention(ctx, runID, task, msg)
+		}
+		return classifyAgentFailure(nil, execRes.ExitCode, out, tctx.Err())
 	}
 
-	// Integrate task: never merge; just summarize.
-	if task.ID == "integrate" || task.Category == "review" {
-		_ = e.RequireApproval // documented behavior
+	// Static review on implementation diffs (warn/block secrets & conflict markers).
+	if shouldIsolate(task) && task.DiffPath != "" {
+		if err := e.reviewTaskDiff(ctx, runID, task); err != nil {
+			return err
+		}
 	}
 
 	if e.Emit != nil {
 		_ = e.Emit(ctx, events.KindTaskCompleted, runID, task.ID, task.AssignedAgent, "task succeeded")
 	}
 	return nil
+}
+
+// classifyAgentFailure turns empty exit -1 / killed adapters into actionable errors.
+func classifyAgentFailure(err error, exitCode int, output string, ctxErr error) error {
+	out := strings.TrimSpace(output)
+	if exitCode == -1 && out == "" {
+		reason := "adapter crashed or was killed (empty output)"
+		if ctxErr != nil {
+			reason = "timed out or cancelled with empty output"
+		} else if err != nil {
+			reason = err.Error()
+		}
+		return fmt.Errorf("agent exit -1 (empty): %s — retrying once is recommended; check CLI auth and logs", reason)
+	}
+	if out == "" && err != nil {
+		return fmt.Errorf("agent exit %d: %w", exitCode, err)
+	}
+	if out == "" {
+		return fmt.Errorf("agent exit %d: (no output)", exitCode)
+	}
+	if err != nil {
+		return fmt.Errorf("agent exit %d: %s (%v)", exitCode, out, err)
+	}
+	return fmt.Errorf("agent exit %d: %s", exitCode, out)
+}
+
+func isIntegrateTask(task *scheduler.Task) bool {
+	if task == nil {
+		return false
+	}
+	if strings.EqualFold(task.Category, "integrate") {
+		return true
+	}
+	id := task.ID
+	if i := strings.LastIndex(id, "-"); i >= 0 {
+		id = id[i+1:]
+	}
+	return id == "integrate"
+}
+
+func isEmptyExitRetryable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "agent exit -1 (empty)")
+}
+
+func (e *Executor) pauseForAttention(ctx context.Context, runID string, task *scheduler.Task, msg string) error {
+	return e.pauseForAttentionKind(ctx, runID, task, "permission", msg)
+}
+
+func shortID(id string) string {
+	if i := strings.LastIndex(id, "-"); i >= 0 && i+1 < len(id) {
+		return id[i+1:]
+	}
+	return id
 }
 
 func (e *Executor) persist(ctx context.Context, runID string, task *scheduler.Task) error {
@@ -192,7 +396,13 @@ func (e *Executor) log() *slog.Logger {
 
 func buildTaskPrompt(req PlanRequest, task *scheduler.Task, workDir string) string {
 	var b strings.Builder
-	b.WriteString("You are a worker agent in QtMesh Agents orchestration.\n")
+	if task.Category == "leadership" || strings.HasSuffix(task.ID, "-lead") || strings.HasSuffix(task.ID, "lead") {
+		b.WriteString("You are the PROJECT LEADER for a QtMesh Agents working bench.\n")
+		b.WriteString("Coordinate the team: outline the plan, risks, and what each worker should focus on.\n")
+		b.WriteString("Do NOT implement large code changes yourself — organize and clarify.\n")
+	} else {
+		b.WriteString("You are a worker agent in a QtMesh Agents project bench.\n")
+	}
 	b.WriteString("Overall objective: " + req.Objective + "\n")
 	b.WriteString("Your task id: " + task.ID + "\n")
 	b.WriteString("Your scoped objective: " + task.Description + "\n")
@@ -206,9 +416,18 @@ func buildTaskPrompt(req PlanRequest, task *scheduler.Task, workDir string) stri
 	b.WriteString("- Do not merge to main/master or force-push.\n")
 	b.WriteString("- Do not discard unrelated user changes.\n")
 	b.WriteString("- Prefer minimal, reviewable diffs.\n")
-	if task.ID == "integrate" || task.Category == "review" {
-		b.WriteString("- Summarize changes across tasks; do NOT merge protected branches.\n")
-		b.WriteString("- State clearly that human approval is required before merge.\n")
+	b.WriteString("- Do NOT ask the human to approve your work for integration or review.\n")
+	b.WriteString("  Finish the scoped work, commit on the feature branch if needed, and exit.\n")
+	b.WriteString("  Integration/merge approval is handled later by the orchestrator (merge_approval).\n")
+	b.WriteString("- Only use NEEDS_HUMAN for real blockers (auth, sandbox, missing secrets, ambiguous product choice):\n")
+	b.WriteString("  NEEDS_HUMAN: <one-line question>\n")
+	b.WriteString("  OPTIONS:\n")
+	b.WriteString("  1) <first choice>\n")
+	b.WriteString("  2) <second choice>\n")
+	if reply := humanReplyFromResult(task.ResultJSON); reply != "" {
+		b.WriteString("\nHuman reply (continue with this guidance):\n")
+		b.WriteString(reply)
+		b.WriteString("\n")
 	}
 	if task.ID == "discover" || task.Category == "architecture" {
 		b.WriteString("- Analyze and report; avoid large refactors in this task.\n")
@@ -220,4 +439,53 @@ func isGitRepo(dir string) bool {
 	cmd := exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree")
 	out, err := cmd.CombinedOutput()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+func humanReplyFromResult(resultJSON string) string {
+	resultJSON = strings.TrimSpace(resultJSON)
+	if resultJSON == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(resultJSON), &m); err != nil {
+		return ""
+	}
+	if s, ok := m["human_reply"].(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func permissionFlagsFromResult(resultJSON string) (elevate, interactive bool) {
+	resultJSON = strings.TrimSpace(resultJSON)
+	if resultJSON == "" {
+		return false, false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(resultJSON), &m); err != nil {
+		return false, false
+	}
+	elevate, _ = m["elevate_sandbox"].(bool)
+	interactive, _ = m["interactive_approvals"].(bool)
+	return elevate, interactive
+}
+
+// mergeHumanReply stores a human reply into result_json without dropping prior output.
+func mergeHumanReply(resultJSON, reply string, opts TaskReplyOpts) string {
+	m := map[string]any{}
+	if strings.TrimSpace(resultJSON) != "" {
+		_ = json.Unmarshal([]byte(resultJSON), &m)
+	}
+	m["human_reply"] = reply
+	if opts.ElevateSandbox {
+		m["elevate_sandbox"] = true
+	}
+	if opts.InteractiveApprovals {
+		m["interactive_approvals"] = true
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return resultJSON
+	}
+	return string(raw)
 }

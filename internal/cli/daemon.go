@@ -62,6 +62,9 @@ func newDaemonStartCmd() *cobra.Command {
 }
 
 func runDaemonForeground(w io.Writer) error {
+	// Survive parent shell exit / hangup when launched via EnsureRunning.
+	signal.Ignore(syscall.SIGHUP)
+
 	if err := config.EnsureDirs(); err != nil {
 		return err
 	}
@@ -107,18 +110,15 @@ func newDaemonStopCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if !ipc.IsDaemonAlive(socket) {
-				fmt.Fprintln(cmd.OutOrStdout(), "daemon not running")
-				return nil
+			if ipc.IsDaemonAlive(socket) {
+				client, err := ipc.Connect(socket)
+				if err == nil {
+					_ = client.Shutdown()
+					_ = client.Close()
+				}
 			}
-			client, err := ipc.Connect(socket)
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-			if err := client.Shutdown(); err != nil {
-				return err
-			}
+			// Reap leftover daemon processes / stale socket (duplicates caused stale UI).
+			daemon.ForceCleanup(socket)
 			fmt.Fprintln(cmd.OutOrStdout(), "daemon stopped")
 			return nil
 		},

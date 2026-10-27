@@ -32,15 +32,26 @@ func (HeuristicPlanner) Plan(ctx context.Context, req PlanRequest) (scheduler.Pl
 	}
 
 	parts := splitObjective(obj)
+	// Project leader organizes the bench before workers execute.
 	tasks := []scheduler.Task{
 		{
-			ID:          "discover",
-			Description: "Analyze the repository and clarify scope for: " + obj,
-			Category:    "architecture",
-			Acceptance:  []string{"Key packages and constraints identified", "Implementation approach outlined"},
-			MaxRetries:  2,
+			ID:          "lead",
+			Description: "As project leader, break down the objective, name risks, and assign focus for the team: " + obj,
+			Category:    "leadership",
+			Acceptance:  []string{"Clear work breakdown written", "Priorities and risks listed for workers"},
+			MaxRetries:  1,
 			Status:      scheduler.StatusPending,
 			ProjectID:   req.ProjectID,
+		},
+		{
+			ID:           "discover",
+			Description:  "Analyze the repository and clarify scope for: " + obj,
+			Category:     "architecture",
+			Dependencies: []string{"lead"},
+			Acceptance:   []string{"Key packages and constraints identified", "Implementation approach outlined"},
+			MaxRetries:   2,
+			Status:       scheduler.StatusPending,
+			ProjectID:    req.ProjectID,
 		},
 	}
 
@@ -100,8 +111,9 @@ func (HeuristicPlanner) Plan(ctx context.Context, req PlanRequest) (scheduler.Pl
 }
 
 func splitObjective(obj string) []string {
-	// Split on " and " / ";" when it yields useful parallel chunks.
-	re := regexp.MustCompile(`(?i)\s+and\s+|;\s*`)
+	// Only split on explicit parallel markers. Do NOT split on numbered lists —
+	// conductors often emit "1) … 2) …" as a single sequential plan.
+	re := regexp.MustCompile(`(?i)\s+;\s+|\s+and also\s+`)
 	parts := re.Split(obj, -1)
 	var out []string
 	for _, p := range parts {
@@ -109,13 +121,17 @@ func splitObjective(obj string) []string {
 		if p == "" {
 			continue
 		}
+		// Drop tiny fragments that are not actionable work items.
+		if len(p) < 12 {
+			continue
+		}
 		out = append(out, p)
 	}
 	if len(out) <= 1 {
 		return []string{"Implement: " + obj}
 	}
-	if len(out) > 4 {
-		out = out[:4]
+	if len(out) > 3 {
+		out = out[:3]
 	}
 	for i := range out {
 		if !strings.HasPrefix(strings.ToLower(out[i]), "implement") {
@@ -287,9 +303,11 @@ func shallowTree(root string, depth int) string {
 }
 
 func trimOut(s string) string {
+	const max = 32_000
 	s = strings.TrimSpace(s)
-	if len(s) > 400 {
-		return s[:400] + "…"
+	if len(s) <= max {
+		return s
 	}
-	return s
+	// Keep the tail — final answers and latest progress matter more than the banner.
+	return "…" + s[len(s)-max:]
 }

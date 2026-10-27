@@ -138,6 +138,8 @@ func (b BaseAdapter) StartPTY(ctx context.Context, opts SessionOptions, extraArg
 }
 
 // RunHeadless runs a non-interactive command capturing stdout/stderr.
+// Uses a process group so context cancel reaps the whole vendor CLI tree.
+// When task.OnOutput is set, output is streamed so callers can detect stalls mid-run.
 func (b BaseAdapter) RunHeadless(ctx context.Context, task AgentTask, args []string) (Execution, error) {
 	started := time.Now()
 	cmd := exec.CommandContext(ctx, b.command, args...)
@@ -148,15 +150,33 @@ func (b BaseAdapter) RunHeadless(ctx context.Context, task AgentTask, args []str
 	for k, v := range task.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	err := cmd.Run()
+	setHeadlessProcGroup(cmd)
+
+	watcher := NewOutputWatcher(task.OnOutput)
+	cmd.Stdout = watcher
+	cmd.Stderr = watcher
+
+	err := cmd.Start()
+	if err == nil {
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			killHeadlessProcGroup(cmd)
+			err = <-done
+			if err == nil {
+				err = ctx.Err()
+			}
+		}
+	}
 	ended := time.Now()
 	exitCode := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
+		} else if ctx.Err() != nil {
+			exitCode = -1
 		} else {
 			exitCode = -1
 		}
@@ -169,11 +189,42 @@ func (b BaseAdapter) RunHeadless(ctx context.Context, task AgentTask, args []str
 		ID:        id,
 		AgentID:   b.id,
 		ExitCode:  exitCode,
-		Output:    buf.String(),
+		Output:    watcher.String(),
 		StartedAt: started,
 		EndedAt:   ended,
 		Err:       err,
 	}, nil
+}
+
+// OutputWatcher buffers process output and optionally streams chunks to OnOutput.
+type OutputWatcher struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+	on  func(chunk, full string)
+}
+
+// NewOutputWatcher creates a stdout/stderr writer that accumulates output and
+// invokes on for each Write when non-nil.
+func NewOutputWatcher(on func(chunk, full string)) *OutputWatcher {
+	return &OutputWatcher{on: on}
+}
+
+func (w *OutputWatcher) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.buf.Write(p)
+	full := w.buf.String()
+	on := w.on
+	w.mu.Unlock()
+	if on != nil && n > 0 {
+		on(string(p[:n]), full)
+	}
+	return n, err
+}
+
+func (w *OutputWatcher) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 // ResolveCommand returns absolute path if found.
@@ -186,6 +237,13 @@ func ResolveCommand(command string) (string, error) {
 	}
 	return exec.LookPath(command)
 }
+
+// SetHeadlessProcGroup puts the command in its own process group (Unix) so
+// KillHeadlessProcGroup can reap vendor CLI child trees on cancel.
+func SetHeadlessProcGroup(cmd *exec.Cmd) { setHeadlessProcGroup(cmd) }
+
+// KillHeadlessProcGroup kills the process group started by SetHeadlessProcGroup.
+func KillHeadlessProcGroup(cmd *exec.Cmd) { killHeadlessProcGroup(cmd) }
 
 // ScanLines is a helper for streaming command output in tests.
 func ScanLines(r io.Reader, fn func(string)) error {

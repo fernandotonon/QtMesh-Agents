@@ -218,6 +218,12 @@ func followRun(cmd *cobra.Command, client *ipc.Client, runID string, interval ti
 		switch info.Status {
 		case "succeeded", "failed", "cancelled":
 			return nil
+		case "needs_attention":
+			fmt.Fprintln(cmd.OutOrStdout(), "---")
+			fmt.Fprintln(cmd.OutOrStdout(), "paused for attention — resolve with TUI NEEDS YOU or:")
+			fmt.Fprintln(cmd.OutOrStdout(), "  qma attention list")
+			fmt.Fprintln(cmd.OutOrStdout(), "  qma attention reply <run-id> <task-id> \"Human reply: Approve apply to main working tree.\"")
+			return nil
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), "---")
 		time.Sleep(interval)

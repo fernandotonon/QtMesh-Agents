@@ -36,6 +36,13 @@ type AgentTask struct {
 	Timeout     time.Duration
 	ExtraArgs   []string
 	Env         map[string]string
+	// ElevatedSandbox requests maximum sandbox access for this run (Codex: danger-full-access).
+	ElevatedSandbox bool
+	// InteractiveApprovals lets the vendor CLI prompt the human (e.g. ChatGPT/Codex app).
+	InteractiveApprovals bool
+	// OnOutput is called with each stdout/stderr chunk and the full buffer so far.
+	// Used to detect mid-run approval / auth stalls before the full timeout.
+	OnOutput func(chunk, full string)
 }
 
 // Execution captures headless run results.

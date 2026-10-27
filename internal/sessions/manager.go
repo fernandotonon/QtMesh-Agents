@@ -287,7 +287,8 @@ func (m *Manager) Resize(id string, cols, rows uint16) error {
 	return ls.Agent.Resize(cols, rows)
 }
 
-// RecoverOnStart marks previously-running sessions as interrupted if PIDs are gone.
+// RecoverOnStart marks previously-running sessions as interrupted if PIDs are gone,
+// then drops non-running session rows so the TUI isn't cluttered with dead PTYs.
 func (m *Manager) RecoverOnStart(ctx context.Context) error {
 	recs, err := m.store.ListSessions(ctx)
 	if err != nil {
@@ -309,6 +310,7 @@ func (m *Manager) RecoverOnStart(ctx context.Context) error {
 			_ = m.store.UpsertSession(ctx, rec)
 		}
 	}
+	_, _ = m.store.DeleteNonRunningSessions(ctx)
 	return nil
 }
 

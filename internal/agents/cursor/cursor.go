@@ -45,7 +45,8 @@ func (a *Adapter) StartSession(ctx context.Context, opts agents.SessionOptions) 
 
 // Execute runs a headless Cursor Agent prompt.
 func (a *Adapter) Execute(ctx context.Context, task agents.AgentTask) (agents.Execution, error) {
-	args := []string{"-p", task.Prompt}
+	// Worktrees are new workspaces; headless execution cannot answer trust prompts.
+	args := append(a.Args(), "--trust", "-p", task.Prompt)
 	args = append(args, task.ExtraArgs...)
 	return a.RunHeadless(ctx, task, args)
 }

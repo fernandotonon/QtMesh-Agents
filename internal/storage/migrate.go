@@ -98,7 +98,93 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 	if err := s.ensureColumns(); err != nil {
 		return err
 	}
-	return s.ensureMigration(2)
+	if err := s.ensureMigration(2); err != nil {
+		return err
+	}
+	// Migration 3: project benches + attention marks.
+	if err := s.migrateBenchesAndAttention(); err != nil {
+		return err
+	}
+	if err := s.ensureMigration(3); err != nil {
+		return err
+	}
+	// Migration 4: reviews + run_metrics (Phase 3).
+	if err := s.migrateReviewsAndMetrics(); err != nil {
+		return err
+	}
+	return s.ensureMigration(4)
+}
+
+func (s *Store) migrateReviewsAndMetrics() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS reviews (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  task_id TEXT,
+  project_id TEXT,
+  summary TEXT NOT NULL,
+  approved INTEGER NOT NULL DEFAULT 0,
+  findings_json TEXT,
+  diff_snippet TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_metrics (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  project_id TEXT,
+  agent_id TEXT,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  retries INTEGER NOT NULL DEFAULT 0,
+  success INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+`)
+	return err
+}
+
+func (s *Store) migrateBenchesAndAttention() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS benches (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  leader_agent_id TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bench_members (
+  bench_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  session_id TEXT,
+  task_id TEXT,
+  PRIMARY KEY (bench_id, agent_id)
+);
+CREATE TABLE IF NOT EXISTS attention (
+  id TEXT PRIMARY KEY,
+  project_id TEXT,
+  bench_id TEXT,
+  run_id TEXT,
+  task_id TEXT,
+  session_id TEXT,
+  agent_id TEXT,
+  kind TEXT NOT NULL,
+  message TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`)
+	if err != nil {
+		return err
+	}
+	if !s.columnExists("runs", "bench_id") {
+		if _, err := s.db.Exec(`ALTER TABLE runs ADD COLUMN bench_id TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ensureMigration(version int) error {
