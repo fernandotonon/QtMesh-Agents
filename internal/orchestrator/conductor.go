@@ -22,10 +22,10 @@ type ChatMessage struct {
 
 // ChatAction is a structured action the conductor decided to take.
 type ChatAction struct {
-	Type      string `json:"type"` // run | none
+	Type      string `json:"type"` // run | goal | none
 	ProjectID string `json:"project_id,omitempty"`
 	Objective string `json:"objective,omitempty"`
-	RunID     string `json:"run_id,omitempty"`
+	RunID     string `json:"run_id,omitempty"` // run id or goal id
 }
 
 // ChatResult is the conductor's response to a user message.
@@ -53,6 +53,7 @@ type Conductor struct {
 
 	mu      sync.Mutex
 	history []ChatMessage
+	loops   *goalLoopState // durable bench goal loops (Bee-like)
 }
 
 func NewConductor(engine *Engine, projects ProjectLister, adapter agents.AgentAdapter) *Conductor {
@@ -69,7 +70,27 @@ func NewConductor(engine *Engine, projects ProjectLister, adapter agents.AgentAd
 }
 
 // SetForceAgent forces every started run onto one agent (useful for tests / mock mode).
-func (c *Conductor) SetForceAgent(agentID string) { c.forceAgent = agentID }
+func (c *Conductor) SetForceAgent(agentID string) { c.forceAgent = strings.TrimSpace(agentID) }
+
+// ForceAgent returns the current worker override (empty = auto-route).
+func (c *Conductor) ForceAgent() string { return c.forceAgent }
+
+// SetAdapter swaps the conversational orchestrator brain at runtime.
+func (c *Conductor) SetAdapter(adapter agents.AgentAdapter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.adapter = adapter
+}
+
+// AdapterID returns the current orchestrator agent id, or empty if heuristic/none.
+func (c *Conductor) AdapterID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.adapter == nil {
+		return ""
+	}
+	return c.adapter.ID()
+}
 
 // History returns a copy of the conversation.
 func (c *Conductor) History() []ChatMessage {
@@ -118,111 +139,221 @@ func (c *Conductor) ChatWith(ctx context.Context, userText string, opts ChatOpts
 		return ChatResult{Reply: intent.Reply, Actions: intent.Actions}, nil
 	}
 
-	// Full orchestrator agent (Cursor preferred): tool loop, then answer/actions.
-	if result, err := c.agenticChat(ctx, userText, refs, focus); err == nil {
-		if isContinueIntent(userText) && c.engine != nil && len(result.Actions) > 0 {
-			for _, act := range result.Actions {
-				if act.ProjectID != "" {
-					_, _ = c.engine.CancelActiveRunsForProject(ctx, act.ProjectID)
+	lower := strings.ToLower(userText)
+
+	// Fresh generation / "continue generating" first (compounds may also ask status).
+	if isFreshWorkIntent(userText) {
+		res := c.handleFreshWork(ctx, userText, refs, focus)
+		c.mu.Lock()
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+		c.mu.Unlock()
+		return res, nil
+	}
+
+	// User correcting / steering an active goal (skip hover, only the other 2…).
+	if isGoalSteerIntent(userText) {
+		if res, ok := c.handleGoalSteer(ctx, userText, refs, focus); ok {
+			c.mu.Lock()
+			c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+			c.mu.Unlock()
+			return res, nil
+		}
+		// No active goal: start one from the correction (do not slice into "generate the hover…").
+		obj := steerObjective(userText, "")
+		res := c.dispatchBenchGoals(ctx, obj, refs, focus, false)
+		c.mu.Lock()
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+		c.mu.Unlock()
+		return res, nil
+	}
+
+	// Short status about generation ("generated?") — never a new goal.
+	if isGenerationStatusAsk(lower) || isProgressQuery(lower) {
+		res := c.progressReply(ctx, userText, refs, focus)
+		c.mu.Lock()
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+		c.mu.Unlock()
+		return res, nil
+	}
+
+	// Pure continue/unstick — resume incomplete verify/integrate or paused goal.
+	if isResumeOnlyIntent(userText) {
+		if res, ok := c.tryResumeIncomplete(ctx, userText, refs, focus); ok {
+			c.mu.Lock()
+			c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+			c.mu.Unlock()
+			return res, nil
+		}
+		if pid := resolveChatProjectID(userText, focus, refs); pid != "" && c.engine != nil {
+			if g, err := c.engine.store.GetActiveBenchGoal(ctx, pid); err == nil && g.Status == storage.GoalPausedNeedsYou {
+				if err := c.ResumeBenchGoal(ctx, g.ID, ""); err == nil {
+					reply := fmt.Sprintf("Resuming paused bench goal `%s` on **%s**.", g.ID, pid)
+					c.mu.Lock()
+					c.history = append(c.history, ChatMessage{Role: "assistant", Content: reply, Timestamp: time.Now().UTC()})
+					c.mu.Unlock()
+					return ChatResult{Reply: reply, Actions: []ChatAction{{Type: "goal", ProjectID: pid, Objective: g.Objective, RunID: g.ID}}}, nil
 				}
 			}
+		}
+	}
+
+	// Other work intents → durable bench goal loop.
+	if isLeaderActionIntent(userText) {
+		res := c.dispatchBenchGoals(ctx, userText, refs, focus, isResumeOnlyIntent(userText))
+		c.mu.Lock()
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+		c.mu.Unlock()
+		return res, nil
+	}
+
+	// Full orchestrator agent (Cursor preferred): tool loop, then answer/actions.
+	var agenticErr error
+	if result, err := c.agenticChat(ctx, userText, refs, focus); err == nil {
+		if len(result.Actions) > 0 {
+			result = c.materializeGoalActions(ctx, result, refs)
 		}
 		c.mu.Lock()
 		c.history = append(c.history, ChatMessage{Role: "assistant", Content: result.Reply, Timestamp: time.Now().UTC()})
 		c.mu.Unlock()
 		return result, nil
+	} else {
+		agenticErr = err
 	}
 
-	// If the agent CLI is unavailable, still answer factual questions from local tools.
-	lower := strings.ToLower(userText)
+	// If the agent CLI is unavailable, still answer factual questions from local tools / leaders.
 	if isOutcomeQuery(lower) || isWorkSummaryQuery(lower) {
 		intent := c.outcomeOrSummaryReply(ctx, refs, focus, lower)
-		c.mu.Lock()
-		c.history = append(c.history, ChatMessage{Role: "assistant", Content: intent.Reply, Timestamp: time.Now().UTC()})
-		c.mu.Unlock()
-		return ChatResult{Reply: intent.Reply}, nil
-	}
-	if isAttentionQuery(lower) || isAuthOrPermissionQuery(lower) {
-		intent := c.attentionDetailReply(ctx)
-		c.mu.Lock()
-		c.history = append(c.history, ChatMessage{Role: "assistant", Content: intent.Reply, Timestamp: time.Now().UTC()})
-		c.mu.Unlock()
-		return ChatResult{Reply: intent.Reply}, nil
-	}
-	if isLeaderConsultQuery(lower) || isJudgmentQuery(lower) {
-		pid := focus
-		if pid == "" {
-			if matched := MatchProjects(userText, refs); len(matched) == 1 {
-				pid = matched[0].ID
-			} else if len(refs) == 1 {
-				pid = refs[0].ID
-			}
-		}
-		reply, err := c.AskLeader(ctx, pid, userText, refs)
-		if err != nil {
-			reply = err.Error()
+		reply := intent.Reply
+		if agenticErr != nil {
+			reply = appendOrchUnavailableNote(reply, agenticErr)
 		}
 		c.mu.Lock()
 		c.history = append(c.history, ChatMessage{Role: "assistant", Content: reply, Timestamp: time.Now().UTC()})
 		c.mu.Unlock()
 		return ChatResult{Reply: reply}, nil
 	}
-	if strings.Contains(lower, "status") || strings.Contains(lower, "how's it going") || lower == "status" {
-		intent := c.statusReply(ctx, refs, focus)
+	if isAttentionQuery(lower) || isAuthOrPermissionQuery(lower) {
+		intent := c.attentionDetailReply(ctx)
+		reply := intent.Reply
+		if agenticErr != nil {
+			reply = appendOrchUnavailableNote(reply, agenticErr)
+		}
 		c.mu.Lock()
-		c.history = append(c.history, ChatMessage{Role: "assistant", Content: intent.Reply, Timestamp: time.Now().UTC()})
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: reply, Timestamp: time.Now().UTC()})
 		c.mu.Unlock()
-		return ChatResult{Reply: intent.Reply}, nil
+		return ChatResult{Reply: reply}, nil
+	}
+	if isLeaderConsultQuery(lower) || isJudgmentQuery(lower) {
+		pid := resolveChatProjectID(userText, focus, refs)
+		reply, err := c.AskLeader(ctx, pid, userText, refs)
+		if err != nil {
+			reply = err.Error()
+		}
+		if agenticErr != nil {
+			reply = appendOrchUnavailableNote(reply, agenticErr)
+		}
+		c.mu.Lock()
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: reply, Timestamp: time.Now().UTC()})
+		c.mu.Unlock()
+		return ChatResult{Reply: reply}, nil
+	}
+	// Any other interrogative: briefing + leader consult — never canned heuristic help.
+	if isInterrogative(userText) {
+		res := c.progressReply(ctx, userText, refs, focus)
+		if agenticErr != nil {
+			res.Reply = appendOrchUnavailableNote(res.Reply, agenticErr)
+		}
+		c.mu.Lock()
+		c.history = append(c.history, ChatMessage{Role: "assistant", Content: res.Reply, Timestamp: time.Now().UTC()})
+		c.mu.Unlock()
+		return res, nil
 	}
 
-	// Fallback: previous interpret / heuristic path if agent unavailable.
+	// Fallback: previous interpret / heuristic path if agent unavailable (work requests only).
 	intent, err := c.interpret(ctx, userText, refs, focus)
 	if err != nil {
 		intent = heuristicIntent(userText, refs)
 	}
 
-	result := ChatResult{Reply: intent.Reply}
-	supersede := isContinueIntent(userText)
-	for _, act := range intent.Actions {
-		if act.Type != "run" || act.Objective == "" {
+	result := c.applyGoalActions(ctx, intent.Reply, intent.Actions, refs, isContinueIntent(userText))
+	c.mu.Lock()
+	c.history = append(c.history, ChatMessage{Role: "assistant", Content: result.Reply, Timestamp: time.Now().UTC()})
+	c.mu.Unlock()
+	return result, nil
+}
+
+// dispatchBenchGoals starts durable goals from a work-intent message.
+func (c *Conductor) dispatchBenchGoals(ctx context.Context, userText string, refs []ProjectRef, focus string, continuing bool) ChatResult {
+	intent := heuristicIntent(userText, refs)
+	if focus != "" && len(intent.Actions) == 0 {
+		if ref, ok := findProject(refs, focus); ok {
+			intent.Actions = []ChatAction{{Type: "run", ProjectID: ref.ID, Objective: userText}}
+			intent.Reply = fmt.Sprintf("Got it — I'll drive a bench goal on %s.", ref.Name)
+		}
+	}
+	if len(intent.Actions) == 0 {
+		pid := resolveChatProjectID(userText, focus, refs)
+		if pid != "" {
+			if ref, ok := findProject(refs, pid); ok {
+				intent.Actions = []ChatAction{{Type: "run", ProjectID: ref.ID, Objective: userText}}
+				intent.Reply = fmt.Sprintf("Got it — I'll drive a bench goal on %s.", ref.Name)
+			}
+		}
+	}
+	if len(intent.Actions) == 0 {
+		if intent.Reply == "" {
+			intent.Reply = "Which project should I start a bench goal on?"
+		}
+		return ChatResult{Reply: intent.Reply}
+	}
+	return c.applyGoalActions(ctx, intent.Reply, intent.Actions, refs, continuing)
+}
+
+func (c *Conductor) materializeGoalActions(ctx context.Context, result ChatResult, refs []ProjectRef) ChatResult {
+	return c.applyGoalActions(ctx, result.Reply, result.Actions, refs, false)
+}
+
+func (c *Conductor) applyGoalActions(ctx context.Context, reply string, actions []ChatAction, refs []ProjectRef, supersede bool) ChatResult {
+	result := ChatResult{Reply: reply}
+	for _, act := range actions {
+		if (act.Type != "run" && act.Type != "goal") || act.Objective == "" {
 			continue
 		}
 		ref, ok := findProject(refs, act.ProjectID)
+		if !ok && len(refs) == 1 {
+			ref, ok = refs[0], true
+		}
 		if !ok {
-			result.Reply += fmt.Sprintf("\n\n(Could not resolve project %q for run.)", act.ProjectID)
+			result.Reply += fmt.Sprintf("\n\n(Could not resolve project %q for goal.)", act.ProjectID)
 			continue
 		}
 		if supersede && c.engine != nil {
 			cancelled, _ := c.engine.CancelActiveRunsForProject(ctx, ref.ID)
 			if len(cancelled) > 0 {
-				result.Reply += fmt.Sprintf("\n\nStopped %d prior run(s) on %s so we can continue cleanly.", len(cancelled), ref.Name)
+				result.Reply += fmt.Sprintf("\n\nStopped %d prior run(s) on %s.", len(cancelled), ref.Name)
 			}
 		}
 		obj := act.Objective
 		if supersede {
 			obj = continueObjective(obj, ref.Name)
 		}
-		runID, err := c.engine.StartRun(ctx, PlanRequest{
-			Objective:     obj,
-			ProjectID:     ref.ID,
-			WorkDir:       ref.Path,
-			AgentOverride: c.forceAgent,
-		})
+		goalID, err := c.StartBenchGoal(ctx, ref.ID, obj, c.forceAgent)
 		if err != nil {
-			result.Reply += fmt.Sprintf("\n\nFailed to start run on %s: %v", ref.Name, err)
+			result.Reply += fmt.Sprintf("\n\nFailed to start bench goal on %s: %v", ref.Name, err)
 			continue
 		}
-		act.RunID = runID
+		act.Type = "goal"
+		act.RunID = goalID
 		act.ProjectID = ref.ID
 		act.Objective = obj
 		result.Actions = append(result.Actions, act)
-		result.Reply += fmt.Sprintf("\n\n▶ Started run `%s` on **%s**: %s", runID, ref.Name, obj)
+		if strings.TrimSpace(result.Reply) == "" || strings.HasPrefix(strings.ToLower(result.Reply), "got it") {
+			result.Reply = fmt.Sprintf("Started on %s: %s", ref.Name, truncateObj(obj, 120))
+		} else {
+			result.Reply = strings.TrimSpace(result.Reply) + fmt.Sprintf("\nStarted on %s: %s", ref.Name, truncateObj(obj, 100))
+		}
 	}
-
-	c.mu.Lock()
-	c.history = append(c.history, ChatMessage{Role: "assistant", Content: result.Reply, Timestamp: time.Now().UTC()})
-	c.mu.Unlock()
-	return result, nil
+	return result
 }
 
 type rawIntent struct {
@@ -404,6 +535,67 @@ func (c *Conductor) attentionDetailReply(ctx context.Context) rawIntent {
 	return rawIntent{Reply: b.String()}
 }
 
+// progressReply answers status/progress as the meta-leader: AskLeader when a
+// project is resolved for a topical progress ask, otherwise a cross-bench snapshot.
+func (c *Conductor) progressReply(ctx context.Context, userText string, refs []ProjectRef, focus string) ChatResult {
+	lower := strings.ToLower(strings.TrimSpace(userText))
+	// Bare status / "how's it going" → orchestrator-wide snapshot (not a single-leader consult).
+	if lower == "status" || lower == "how's it going" || lower == "hows it going" ||
+		lower == "how is it going" || lower == "how's it going?" || lower == "how is it going?" {
+		intent := c.statusReply(ctx, refs, focus)
+		return ChatResult{Reply: intent.Reply}
+	}
+
+	pid := resolveChatProjectID(userText, focus, refs)
+	matched := MatchProjects(userText, refs)
+	if len(matched) > 1 && strings.TrimSpace(focus) == "" {
+		var b strings.Builder
+		for _, ref := range matched {
+			if gp := c.FormatGoalProgress(ctx, ref.ID); gp != "" {
+				b.WriteString(ref.Name + ": " + gp + "\n")
+			}
+		}
+		if b.Len() == 0 {
+			return ChatResult{Reply: "No active bench goals on the matched projects."}
+		}
+		return ChatResult{Reply: strings.TrimSpace(b.String())}
+	}
+	if pid != "" {
+		gp := c.FormatGoalProgress(ctx, pid)
+		// Short status asks ("generated?") — local snapshot only, no leader dump.
+		if isGenerationStatusAsk(lower) || len(strings.TrimSpace(userText)) < 24 {
+			if gp == "" {
+				return ChatResult{Reply: "No bench goal on that project yet."}
+			}
+			return ChatResult{Reply: gp}
+		}
+		reply, err := c.AskLeader(ctx, pid, userText, refs)
+		if err != nil {
+			if gp != "" {
+				return ChatResult{Reply: gp}
+			}
+			return ChatResult{Reply: fmt.Sprintf("No leader reply (%v).", err)}
+		}
+		reply = strings.TrimSpace(reply)
+		if gp != "" && !strings.Contains(reply, "Goal [") {
+			reply = gp + "\n" + truncateObj(reply, 400)
+		} else {
+			reply = truncateObj(reply, 500)
+		}
+		return ChatResult{Reply: strings.TrimSpace(reply)}
+	}
+	intent := c.statusReply(ctx, refs, focus)
+	return ChatResult{Reply: intent.Reply}
+}
+
+func appendOrchUnavailableNote(reply string, err error) string {
+	if err == nil {
+		return reply
+	}
+	note := fmt.Sprintf("\n\n_(Orchestrator vendor agent unavailable: %v — answered from live briefing / project leaders.)_", err)
+	return strings.TrimSpace(reply) + note
+}
+
 func (c *Conductor) statusReply(ctx context.Context, refs []ProjectRef, focusProjectID string) rawIntent {
 	var b strings.Builder
 	b.WriteString("Orchestrator status\n")
@@ -499,6 +691,275 @@ func isContinueIntent(text string) bool {
 	return containsAny(lower, []string{
 		"continue", "resume", "keep going", "pick up", "finish the", "finish what",
 		"carry on", "where we left", "work so far", "what you made", "made so far",
+		"go ahead", "go on", "do it", "do that", "unstick", "unblock", "land it",
+		"merge it", "ship it", "finish up", "wrap up",
+	})
+}
+
+// isFreshWorkIntent is true for generate/regenerate verbs (and "continue generating"),
+// which must start/drive a bench goal — never resume a stuck verify/integrate.
+// Does NOT match past-tense-only "generated?" or negated "do not generate…" (status/steer).
+func isFreshWorkIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" || isNegatedGenerate(lower) {
+		return false
+	}
+	if containsAny(lower, []string{
+		"continue generating", "keep generating", "start generating",
+		"resume generating", "re-generate", "regenerate",
+		"please generate", "please regenerate",
+	}) {
+		return true
+	}
+	// Word-boundary: "generate" / "generating", not substring of "generated".
+	if hasWord(lower, "generate") || hasWord(lower, "generating") {
+		return true
+	}
+	return false
+}
+
+// isGenerationStatusAsk is a short/outcome ask about whether generation finished —
+// must never become a bench goal objective (e.g. "generated?").
+func isGenerationStatusAsk(lower string) bool {
+	lower = strings.TrimSpace(strings.ToLower(lower))
+	if lower == "" || isFreshWorkIntent(lower) || isNegatedGenerate(lower) {
+		return false
+	}
+	switch lower {
+	case "generated?", "generated", "done generating?", "finished generating?",
+		"generation done?", "generation finished?", "was it generated?",
+		"did it generate?", "another generated?", "was another generated?":
+		return true
+	}
+	if !strings.Contains(lower, "?") && !strings.HasPrefix(lower, "was ") &&
+		!strings.HasPrefix(lower, "did ") && !strings.HasPrefix(lower, "is ") {
+		return false
+	}
+	// "was another deckbot generated?" / "did trellis finish?"
+	if hasWord(lower, "generated") || strings.Contains(lower, "generation done") ||
+		strings.Contains(lower, "generation finish") || strings.Contains(lower, "trellis finish") ||
+		(strings.Contains(lower, "another") && strings.Contains(lower, "deckbot")) {
+		return true
+	}
+	return false
+}
+
+// isNegatedGenerate matches corrections that forbid (re)generating something.
+func isNegatedGenerate(lower string) bool {
+	lower = strings.ToLower(lower)
+	return containsAny(lower, []string{
+		"do not generate", "don't generate", "dont generate",
+		"do not regenerate", "don't regenerate", "dont regenerate",
+		"stop generating", "never generate", "skip generating",
+		"without generating", "don't re-generate", "do not re-generate",
+		"do not redo", "don't redo", "dont redo",
+	})
+}
+
+// isGoalSteerIntent is a mid-goal correction/constraint (skip asset, only remaining, OOM serial).
+func isGoalSteerIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	if isNegatedGenerate(lower) {
+		return true
+	}
+	return containsAny(lower, []string{
+		"only the other", "only the remaining", "only the missing",
+		"missing only", "just the other", "skip the hover", "skip hover",
+		"not the hover", "already generated", "already done",
+		"do not generate the hover", "don't generate the hover",
+	})
+}
+
+// isResumeOnlyIntent is continue/unstick without a fresh generate request.
+func isResumeOnlyIntent(text string) bool {
+	if isFreshWorkIntent(text) || isGoalSteerIntent(text) {
+		return false
+	}
+	return isContinueIntent(text)
+}
+
+// handleGoalSteer amends an active/paused bench goal from a user correction.
+// Returns ok=false when there is no goal to steer (caller may start fresh work).
+func (c *Conductor) handleGoalSteer(ctx context.Context, userText string, refs []ProjectRef, focus string) (ChatResult, bool) {
+	pid := resolveChatProjectID(userText, focus, refs)
+	if pid == "" || c.engine == nil || c.engine.store == nil {
+		return ChatResult{}, false
+	}
+	g, err := c.engine.store.GetActiveBenchGoal(ctx, pid)
+	if err != nil || g.ID == "" {
+		return ChatResult{}, false
+	}
+	obj := steerObjective(userText, g.Objective)
+	if err := c.AmendBenchGoal(ctx, g.ID, obj, userText); err != nil {
+		return ChatResult{Reply: "Could not update the running goal: " + err.Error()}, true
+	}
+	if g.Status == storage.GoalPausedNeedsYou {
+		_ = c.ResumeBenchGoal(ctx, g.ID, "")
+	}
+	reply := fmt.Sprintf("Got it — updated the running goal to: %s", truncateObj(obj, 140))
+	return ChatResult{
+		Reply:   reply,
+		Actions: []ChatAction{{Type: "goal", ProjectID: pid, Objective: obj, RunID: g.ID}},
+	}, true
+}
+
+// steerObjective turns a correction into a durable goal objective.
+func steerObjective(userText, current string) string {
+	obj := strings.TrimSpace(userText)
+	lower := strings.ToLower(obj)
+	// Keep prior scope when the correction is a short constraint.
+	if len(obj) < 40 && current != "" && !hasWord(lower, "generate") && !isNegatedGenerate(lower) {
+		obj = strings.TrimSpace(current + " — " + obj)
+	}
+	if containsAny(lower, []string{"one at a time", "one a time", "avoid oom", "oom"}) &&
+		!strings.Contains(strings.ToLower(obj), "one at a time to avoid oom") {
+		obj += " Generate one at a time to avoid OOM; wait for each to finish before the next."
+	}
+	return obj
+}
+
+// handleFreshWork answers status if a goal is already active; otherwise starts a bench goal.
+func (c *Conductor) handleFreshWork(ctx context.Context, userText string, refs []ProjectRef, focus string) ChatResult {
+	pid := resolveChatProjectID(userText, focus, refs)
+	obj := extractGenerateObjective(userText)
+	if pid != "" && c.engine != nil && c.engine.store != nil {
+		if g, err := c.engine.store.GetActiveBenchGoal(ctx, pid); err == nil && g.ID != "" {
+			// Mid-flight correction phrased as generate work → amend, don't ignore.
+			if isGoalSteerIntent(userText) {
+				if res, ok := c.handleGoalSteer(ctx, userText, refs, focus); ok {
+					return res
+				}
+			}
+			switch g.Status {
+			case storage.GoalActive:
+				reply := fmt.Sprintf("Already running — %s", truncateObj(g.Objective, 120))
+				return ChatResult{Reply: reply, Actions: []ChatAction{{Type: "goal", ProjectID: pid, Objective: g.Objective, RunID: g.ID}}}
+			case storage.GoalPausedNeedsYou:
+				_ = c.ResumeBenchGoal(ctx, g.ID, "")
+				reply := fmt.Sprintf("Resumed — %s", truncateObj(g.Objective, 120))
+				return ChatResult{Reply: reply, Actions: []ChatAction{{Type: "goal", ProjectID: pid, Objective: g.Objective, RunID: g.ID}}}
+			}
+		}
+	}
+	// Build objective that honors "one at a time" style constraints when present.
+	if containsAny(strings.ToLower(userText), []string{"one at a time", "one a time", "avoid oom", "oom"}) &&
+		!strings.Contains(strings.ToLower(obj), "one at a time to avoid oom") {
+		obj = obj + " Generate one at a time to avoid OOM; wait for each to finish before the next."
+	}
+	return c.dispatchBenchGoals(ctx, obj, refs, focus, false)
+}
+
+// extractGenerateObjective picks the work clause from compound status+generate messages.
+// Never slices into a negated "do not generate…".
+func extractGenerateObjective(userText string) string {
+	obj := strings.TrimSpace(userText)
+	lower := strings.ToLower(obj)
+	if isNegatedGenerate(lower) {
+		return obj
+	}
+	if i := strings.Index(lower, "continue generating"); i >= 0 {
+		return strings.TrimSpace(obj[i:])
+	}
+	// Find a generate/regenerate verb occurrence that is not part of "generated".
+	for _, verb := range []string{"regenerate", "re-generate", "generating", "generate"} {
+		search := lower
+		offset := 0
+		for {
+			i := strings.Index(search, verb)
+			if i < 0 {
+				break
+			}
+			abs := offset + i
+			after := abs + len(verb)
+			if after < len(lower) && isAlphaByte(lower[after]) {
+				// e.g. "generated" — keep scanning
+				search = lower[after:]
+				offset = after
+				continue
+			}
+			before := lower[:abs]
+			if strings.HasSuffix(strings.TrimSpace(before), "not") ||
+				strings.HasSuffix(strings.TrimSpace(before), "don't") ||
+				strings.HasSuffix(strings.TrimSpace(before), "dont") ||
+				strings.Contains(before[max(0, abs-12):abs], "do not") ||
+				strings.Contains(before[max(0, abs-8):abs], "don't") {
+				search = lower[after:]
+				offset = after
+				continue
+			}
+			return strings.TrimSpace(obj[abs:])
+		}
+	}
+	return obj
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func hasWord(s, word string) bool {
+	if word == "" {
+		return false
+	}
+	idx := 0
+	for {
+		i := strings.Index(s[idx:], word)
+		if i < 0 {
+			return false
+		}
+		i += idx
+		beforeOK := i == 0 || !isAlphaByte(s[i-1])
+		after := i + len(word)
+		afterOK := after >= len(s) || !isAlphaByte(s[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		idx = i + 1
+	}
+}
+
+func isAlphaByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// isLeaderActionIntent is true when the human is telling the leader to act
+// (start/resume work), not just asking for advice.
+func isLeaderActionIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" || isGenerationStatusAsk(lower) || isNegatedGenerate(lower) {
+		return false
+	}
+	// Questions stay advisory ("did you generate…?", "where are the models?").
+	if strings.HasSuffix(lower, "?") ||
+		strings.HasPrefix(lower, "did ") || strings.HasPrefix(lower, "do you ") ||
+		strings.HasPrefix(lower, "does ") || strings.HasPrefix(lower, "is ") ||
+		strings.HasPrefix(lower, "are ") || strings.HasPrefix(lower, "what ") ||
+		strings.HasPrefix(lower, "where ") || strings.HasPrefix(lower, "why ") ||
+		strings.HasPrefix(lower, "how ") || strings.HasPrefix(lower, "when ") ||
+		strings.HasPrefix(lower, "who ") || strings.HasPrefix(lower, "which ") {
+		// Exception: "can you generate…" / "could you fix…" are requests.
+		if !(strings.HasPrefix(lower, "can you ") || strings.HasPrefix(lower, "could you ") ||
+			strings.HasPrefix(lower, "would you ") || strings.HasPrefix(lower, "will you ")) {
+			return false
+		}
+	}
+	if isContinueIntent(lower) {
+		return true
+	}
+	if hasWord(lower, "generate") || hasWord(lower, "generating") ||
+		containsAny(lower, []string{"regenerate", "re-generate"}) {
+		return true
+	}
+	return containsAny(lower, []string{
+		"implement", "start ", "start a", "run ",
+		"please do", "do the", "fix ", "build ", "create ", "update ",
+		"then continue", "orchestrate", "kick off", "retry", "re-run", "rerun",
 	})
 }
 
@@ -550,6 +1011,7 @@ func heuristicIntent(userText string, refs []ProjectRef) rawIntent {
 	looksLikeWork := continuing || containsAny(lower, []string{
 		"implement", "add ", "fix ", "build ", "create ", "refactor", "update ", "write ",
 		"run ", "please ", "can you ", "could you ", "orchestrate", "ship ", "complete ",
+		"generate", "regenerate", "go ahead",
 	})
 
 	if !looksLikeWork {

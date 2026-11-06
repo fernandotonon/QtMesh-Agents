@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -60,20 +61,25 @@ type Model struct {
 	attnOptCur  int
 	attnQuestion string
 
+	orchWorking string // transient feedback while a chat request is in flight
 	orchLog     []string
 	orchView    viewport.Model
 	agentOutput string
 	agentView   viewport.Model
 	input       textinput.Model
 	ready       bool
+
+	// chatWide hides the left tree so mouse-drag copy only selects chat text.
+	chatWide bool
+	statusFlash string
 }
 
 // New constructs the TUI model.
 func New(client *ipc.Client) Model {
 	ti := textinput.New()
-	ti.Placeholder = "Talk to orchestrator · j/k navigate tree · enter open · Tab focus"
+	ti.Placeholder = "Talk to orchestrator · f chat-wide copy · y yank chat · Tab focus"
 	ti.Focus()
-	ti.CharLimit = 512
+	ti.CharLimit = 4000
 	ti.Width = 60
 
 	vp := viewport.New(40, 10)
@@ -91,7 +97,7 @@ func New(client *ipc.Client) Model {
 		agentView: vp,
 		orchView:  orchVP,
 		orchLog: []string{
-			"system: Welcome to QtMesh Agents.\n\nThe **orchestrator is a full agent** (Cursor-first): it uses tools to inspect git, worktrees, runs, install, and start work.\nAsk anything — or select **leader:…** to talk to the project lead.\nKeys: Tab · j/k · enter · pgup/pgdn · q quit",
+			"system: Welcome to QtMesh Agents.\n\nThe **orchestrator** drives durable bench goals across projects.\nAsk anything — or select **leader:…** to talk to the project lead.\n\nKeys: Tab focus · f chat-wide (for mouse copy) · y yank chat to clipboard · pgup/pgdn scroll · q quit",
 		},
 	}
 	m.syncOrchView()
@@ -113,6 +119,9 @@ type outputMsg struct {
 	data      string
 }
 type statusLineMsg string
+
+// chatReplyMsg distinguishes chat completion from unrelated command status.
+type chatReplyMsg struct{ status statusLineMsg }
 type attachedMsg struct {
 	id   string
 	note string
@@ -234,6 +243,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.errMsg = msg.err.Error()
 		return m, nil
 
+	case chatReplyMsg:
+		m.orchWorking = ""
+		return m.Update(msg.status)
+
 	case statusLineMsg:
 		text := strings.TrimRight(string(msg), "\r\n")
 		keepTask := false
@@ -256,7 +269,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !keepTask {
 			m.mode = modeOrchestrator
 		}
-		m.syncOrchView()
+		m.syncOrchViewOpts(true) // new message → stay on latest
 		m.layout()
 		return m, refreshCmd(m.client)
 
@@ -356,8 +369,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.input.Value() == "" {
 				return m, tea.Quit
 			}
+		case "f":
+			// Toggle chat-wide layout so terminal mouse selection doesn't grab the tree.
+			if m.focus == focusInput && m.input.Value() != "" {
+				break // typing an "f"
+			}
+			if m.mode == modeOrchestrator || m.mode == modeAgent {
+				m.chatWide = !m.chatWide
+				if m.chatWide {
+					m.statusFlash = "Chat-wide on — drag to copy chat only · press f again for tree"
+					m.focus = focusInput
+					m.input.Focus()
+				} else {
+					m.statusFlash = "Chat-wide off — tree visible"
+				}
+				m.layout()
+				return m, nil
+			}
+		case "y":
+			if m.focus == focusInput && m.input.Value() != "" {
+				break // typing a "y"
+			}
+			if m.mode == modeOrchestrator {
+				text := orchLogPlain(m.orchLog)
+				if err := clipboard.WriteAll(text); err != nil {
+					m.statusFlash = "Yank failed: " + err.Error()
+				} else {
+					m.statusFlash = fmt.Sprintf("Copied %d chars of chat to clipboard", len(text))
+				}
+				return m, nil
+			}
+		case "Y":
+			if m.focus == focusInput && m.input.Value() != "" {
+				break
+			}
+			if m.mode == modeOrchestrator {
+				text := lastOrchReplyPlain(m.orchLog)
+				if err := clipboard.WriteAll(text); err != nil {
+					m.statusFlash = "Yank failed: " + err.Error()
+				} else {
+					m.statusFlash = "Copied last orchestrator reply to clipboard"
+				}
+				return m, nil
+			}
 		case "pgup", "pgdown", "ctrl+u", "ctrl+d":
-			if m.mode == modeOrchestrator && m.focus == focusInput {
+			// Main orch pane scrolls regardless of tree/input focus (tree still uses j/k).
+			if m.mode == modeOrchestrator {
 				var cmd tea.Cmd
 				m.orchView, cmd = m.orchView.Update(msg)
 				return m, cmd
@@ -398,6 +455,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key == "enter" {
+			// Keep a single chat request in flight and preserve any drafted text.
+			if m.orchWorking != "" {
+				return m, nil
+			}
 			line := strings.TrimSpace(m.input.Value())
 			m.input.SetValue("")
 			if line == "" {
@@ -424,11 +485,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.attachedID == "" && !isMetaCommand(line) {
 				if m.talkingToLeader() {
 					m.orchLog = appendOrchTurn(m.orchLog, "you→leader", line)
+					m.orchWorking = "Leader is thinking…"
 				} else {
 					m.orchLog = appendOrchTurn(m.orchLog, "you", line)
+					m.orchWorking = "Orchestrator is working…"
 				}
 				m.mode = modeOrchestrator
-				m.syncOrchView()
+				m.layout()
 			}
 			if m.talkingToLeader() && m.attachedID == "" && !isMetaCommand(line) {
 				pid := m.selectedFocusProjectID()
@@ -436,12 +499,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, func() tea.Msg {
 					resp, err := client.LeaderConsult(pid, line)
 					if err != nil {
-						return statusLineMsg("leader error: " + err.Error())
+						return chatReplyMsg{statusLineMsg("leader error: " + err.Error())}
 					}
-					return statusLineMsg("leader: " + resp.Reply)
+					return chatReplyMsg{statusLineMsg("leader: " + resp.Reply)}
 				}
 			}
-			return m, m.handleCommand(line)
+			cmd := m.handleCommand(line)
+			if m.orchWorking != "" {
+				return m, func() tea.Msg {
+					return chatReplyMsg{cmd().(statusLineMsg)}
+				}
+			}
+			return m, cmd
 		}
 	}
 
@@ -656,10 +725,15 @@ func (m Model) activateNode() (tea.Model, tea.Cmd) {
 
 func (m *Model) layout() {
 	sideW := 30
-	if m.width < 70 {
+	if m.chatWide {
+		sideW = 0
+	} else if m.width < 70 {
 		sideW = max(18, m.width/2)
 	}
-	mainW := m.width - sideW - 1
+	mainW := m.width - sideW
+	if sideW > 0 {
+		mainW--
+	}
 	if mainW < 16 {
 		mainW = 16
 	}
@@ -682,9 +756,15 @@ func (m *Model) layout() {
 	} else if m.talkingToLeader() {
 		m.input.Width = max(10, m.width-len("LEADER › ")-2)
 		m.input.Placeholder = "ask the project leader…"
+	} else if m.chatWide {
+		m.input.Width = max(10, m.width-4)
+		m.input.Placeholder = "Chat-wide · f show tree · y yank all · Y yank last reply"
 	} else {
 		m.input.Width = max(10, m.width-4)
-		m.input.Placeholder = "Talk to orchestrator · select leader to consult lead · Tab focus"
+		m.input.Placeholder = "Talk to orchestrator · f chat-wide copy · y yank · Tab focus"
+	}
+	if m.orchWorking != "" {
+		m.input.Placeholder = "Working…"
 	}
 	m.syncOrchView()
 	m.ensureTreeVisible()
@@ -812,14 +892,28 @@ func (m Model) applyAttentionOption() (tea.Model, tea.Cmd) {
 	}
 }
 
-// syncOrchView refreshes the orchestrator chat viewport and pins to the latest message.
+// syncOrchView refreshes the orchestrator chat viewport.
+// Scroll stays put when the user has scrolled up; new content while pinned
+// (or an explicit pin) jumps to the latest message.
 func (m *Model) syncOrchView() {
+	m.syncOrchViewOpts(false)
+}
+
+func (m *Model) syncOrchViewOpts(forceBottom bool) {
 	w := m.orchView.Width
 	if w < 10 {
 		w = 40
 	}
-	m.orchView.SetContent(renderOrchChat(m.orchLog, w))
-	m.orchView.GotoBottom()
+	pin := forceBottom || m.orchView.AtBottom()
+	log := m.orchLog
+	if m.orchWorking != "" {
+		// Copy before appending: model updates must not mutate the stored history.
+		log = appendOrchTurn(append([]string(nil), log...), "note", m.orchWorking)
+	}
+	m.orchView.SetContent(renderOrchChat(log, w))
+	if pin {
+		m.orchView.GotoBottom()
+	}
 }
 
 func (m Model) handleCommand(line string) tea.Cmd {

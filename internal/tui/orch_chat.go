@@ -20,6 +20,51 @@ var (
 	bulletStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
 )
 
+// orchLogPlain returns the chat history as plain text (for clipboard yank).
+func orchLogPlain(log []string) string {
+	var b strings.Builder
+	for _, entry := range log {
+		role, body := parseOrchTurn(entry)
+		if role == "blank" {
+			continue
+		}
+		label := role
+		switch role {
+		case "you":
+			label = "You"
+		case "you→leader":
+			label = "You → Leader"
+		case "leader":
+			label = "Leader"
+		case "orch":
+			label = "Orchestrator"
+		case "note":
+			label = "Note"
+		case "system":
+			label = "System"
+		}
+		b.WriteString(label)
+		b.WriteString("\n")
+		b.WriteString(body)
+		if !strings.HasSuffix(body, "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+// lastOrchReplyPlain returns the most recent orchestrator/leader reply body.
+func lastOrchReplyPlain(log []string) string {
+	for i := len(log) - 1; i >= 0; i-- {
+		role, body := parseOrchTurn(log[i])
+		if role == "orch" || role == "leader" {
+			return strings.TrimSpace(body) + "\n"
+		}
+	}
+	return orchLogPlain(log)
+}
+
 // appendOrchTurn stores one conversational turn as a single log entry (multi-line OK).
 func appendOrchTurn(log []string, role, text string) []string {
 	text = strings.TrimRight(text, "\r\n")

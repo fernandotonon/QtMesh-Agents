@@ -428,6 +428,75 @@ func isWorkSummaryQuery(lower string) bool {
 	return false
 }
 
+// isProgressQuery matches status/progress asks like "how is the deckbot generation going?".
+func isProgressQuery(lower string) bool {
+	// Fresh generate / continue-generating is handled as work, not status-only.
+	if isFreshWorkIntent(lower) || isLeaderActionIntent(lower) {
+		return false
+	}
+	if isResumeOnlyIntent(lower) {
+		return false
+	}
+	if isGenerationStatusAsk(lower) {
+		return true
+	}
+	if isGenerationStatusAsk(lower) {
+		return true
+	}
+	keys := []string{
+		"how is ", "how's ", "hows ", "how are ",
+		"going on", "going with", "any update", "any updates",
+		"progress on", "progress with", "what's the status", "whats the status",
+		"status of", "status on", "generation going", "still working",
+		"how's it going", "hows it going", "how is it going",
+	}
+	for _, k := range keys {
+		if strings.Contains(lower, k) {
+			return true
+		}
+	}
+	if lower == "status" || strings.HasPrefix(lower, "status ") || strings.HasSuffix(lower, " status?") {
+		return true
+	}
+	return false
+}
+
+// isInterrogative is true for question-like turns that must never get canned "Happy to help" text.
+func isInterrogative(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "?") {
+		return true
+	}
+	return strings.HasPrefix(lower, "how ") || strings.HasPrefix(lower, "what ") ||
+		strings.HasPrefix(lower, "where ") || strings.HasPrefix(lower, "why ") ||
+		strings.HasPrefix(lower, "when ") || strings.HasPrefix(lower, "who ") ||
+		strings.HasPrefix(lower, "which ") || strings.HasPrefix(lower, "did ") ||
+		strings.HasPrefix(lower, "do ") || strings.HasPrefix(lower, "does ") ||
+		strings.HasPrefix(lower, "is ") || strings.HasPrefix(lower, "are ") ||
+		strings.HasPrefix(lower, "was ") || strings.HasPrefix(lower, "were ") ||
+		strings.HasPrefix(lower, "can ") || strings.HasPrefix(lower, "could ") ||
+		strings.HasPrefix(lower, "should ") || strings.HasPrefix(lower, "will ")
+}
+
+// resolveChatProjectID picks TUI focus, then a single MatchProjects hit, then the only registered project.
+func resolveChatProjectID(userText, focus string, refs []ProjectRef) string {
+	if pid := strings.TrimSpace(focus); pid != "" {
+		if _, ok := findProject(refs, pid); ok {
+			return pid
+		}
+	}
+	if matched := MatchProjects(userText, refs); len(matched) == 1 {
+		return matched[0].ID
+	}
+	if len(refs) == 1 {
+		return refs[0].ID
+	}
+	return ""
+}
+
 func isOutcomeQuery(lower string) bool {
 	keys := []string{
 		"did it work", "did that work", "did the run work", "did the install",

@@ -11,57 +11,111 @@ var (
 	reAuthRequired   = regexp.MustCompile(`(?i)authrequired\s*\(|authrequirederror|www-authenticate\s*:|www_authenticate`)
 )
 
+// looksLikeGraphicsSandboxBlock detects Codex seatbelt / sandbox blocking GPU
+// (Metal/OpenGL). qtmesh and similar tools crash with CGLDescribeRenderer /
+// exit 139 under workspace-write; the fix is elevated sandbox, not a human Q&A.
+func looksLikeGraphicsSandboxBlock(output string) (bool, string) {
+	filtered := strings.ToLower(stripAgentBanners(stripEchoedUserPrompt(output)))
+	filtered = stripOptionalMcpAuthNoise(filtered)
+	if filtered == "" {
+		return false, ""
+	}
+	needles := []string{
+		"cgldescriberenderer",
+		"cglchoosepixelformat",
+		"macos graphics",
+		"graphics access",
+		"graphics-enabled",
+		"graphics/gpu",
+		"gpu access",
+		"lacks graphics",
+		"without graphics",
+		"needs graphics",
+		"qt offscreen",
+		"qmlgl",
+		"metal device",
+		"no gpu",
+		"opengl",
+		"exit 139",
+		"signal: segmentation fault",
+		"sigsegv",
+	}
+	hit := false
+	for _, n := range needles {
+		if containsAttentionNeedle(filtered, n) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		// Broader: agent asking to rerun with graphics while mentioning qtmesh/sandbox.
+		if (strings.Contains(filtered, "graphics") || strings.Contains(filtered, "gpu")) &&
+			(strings.Contains(filtered, "sandbox") || strings.Contains(filtered, "qtmesh") ||
+				strings.Contains(filtered, "needs_human") || strings.Contains(filtered, "rerun") ||
+				strings.Contains(filtered, "re-run") || strings.Contains(filtered, "session")) {
+			hit = true
+		}
+	}
+	if !hit {
+		return false, ""
+	}
+	return true, "GPU/graphics blocked by Codex sandbox — elevating to full access"
+}
+
 // looksLikeNeedsAttention detects agent output that usually means the human
 // must approve a permission / answer a prompt / complete auth.
+// Soft stalls (sandbox / elevate-able permission) are reported via
+// looksLikeSoftStall so the executor can auto-recover without Needs you.
 func looksLikeNeedsAttention(output string, exitCode int) (bool, string) {
+	if hard, msg := looksLikeHardNeedsYou(output, exitCode); hard {
+		return true, msg
+	}
+	// Back-compat: soft stalls still count as "needs attention" for detectors
+	// that only call this helper — executor prefers looksLikeSoftStall first.
+	return looksLikeSoftStall(output)
+}
+
+// looksLikeHardNeedsYou is auth/login/true human choice — silence never means yes.
+func looksLikeHardNeedsYou(output string, exitCode int) (bool, string) {
 	lower := strings.ToLower(stripEchoedUserPrompt(output))
 	filtered := stripAgentBanners(lower)
 	filtered = stripOptionalMcpAuthNoise(filtered)
 
-	// Prefer a real agent utterance — return the reason text for the UI.
 	if m := reNeedsHumanLine.FindStringSubmatch(filtered); len(m) == 2 {
 		reason := strings.TrimSpace(m[1])
 		if !isTemplatePlaceholder(reason) && !isIntegrationApprovalNoise(reason) {
+			// Soft phrasing inside NEEDS_HUMAN still goes hard — explicit agent ask.
 			return true, reason
 		}
 	}
 
-	patterns := []struct {
+	hard := []struct {
 		needle string
 		msg    string
 	}{
-		// Avoid bare "approval required" — it matches policy docs
-		// ("Approval required for merge / destructive git ops").
-		{"waiting for approval", "agent is waiting for approval"},
-		{"ask for approval", "agent wants approval to continue"},
-		{"do you want to allow", "agent is prompting for confirmation"},
-		{"permission denied", "permission denied — needs elevated access or approval"},
-		{"requires permission", "agent requires permission"},
-		{"press enter to continue", "agent paused for interactive continue"},
-		{"waiting for user", "agent waiting for user input"},
-		{"sandbox violation", "sandbox blocked an action — needs attention"},
-		{"exceeded permissions", "agent exceeded sandbox permissions"},
 		{"authorization required", "agent needs authentication"},
+		{"authentication required", "agent needs authentication"},
 		{"please login", "agent needs you to log in"},
 		{"please sign in", "agent needs you to sign in"},
+		{"please run 'agent login'", "agent needs you to log in"},
+		{"please run \"agent login\"", "agent needs you to log in"},
+		{"run 'agent login'", "agent needs you to log in"},
+		{"do you want to allow", "agent is prompting for confirmation"},
 		{"confirm to continue", "agent is waiting for confirmation"},
+		{"waiting for user", "agent waiting for user input"},
+		{"ask for approval", "agent wants approval to continue"},
 	}
-	for _, p := range patterns {
+	for _, p := range hard {
 		if containsAttentionNeedle(filtered, p.needle) {
-			// Ignore soft "waiting for approval" when it's really integration ask spam.
 			if isIntegrationApprovalNoise(filtered) {
 				continue
 			}
 			return true, p.msg
 		}
 	}
-	// AuthRequired only on non-source lines. Agents editing this repo dump
-	// attention_detect.go itself (reAuthRequired := MustCompile(...)), which
-	// must not pause the run after optional MCP noise is stripped.
 	if authRequiredBlockingLine(filtered) {
 		return true, "agent needs authentication (OAuth / login)"
 	}
-	// y/n only as its own prompt line, not buried in code/docs.
 	for _, line := range strings.Split(filtered, "\n") {
 		trim := strings.TrimSpace(line)
 		if trim == "[y/n]" || trim == "(y/n)" || trim == "y/n" || trim == "yes/no" {
@@ -69,6 +123,33 @@ func looksLikeNeedsAttention(output string, exitCode int) (bool, string) {
 		}
 	}
 	_ = exitCode
+	return false, ""
+}
+
+// looksLikeSoftStall is auto-recoverable (elevate sandbox / retry / fallback).
+func looksLikeSoftStall(output string) (bool, string) {
+	lower := strings.ToLower(stripEchoedUserPrompt(output))
+	filtered := stripAgentBanners(lower)
+	filtered = stripOptionalMcpAuthNoise(filtered)
+	soft := []struct {
+		needle string
+		msg    string
+	}{
+		{"waiting for approval", "agent is waiting for approval"},
+		{"permission denied", "permission denied — elevating / retrying"},
+		{"requires permission", "agent requires permission — elevating / retrying"},
+		{"press enter to continue", "agent paused for interactive continue"},
+		{"sandbox violation", "sandbox blocked an action — elevating"},
+		{"exceeded permissions", "agent exceeded sandbox permissions — elevating"},
+	}
+	for _, p := range soft {
+		if containsAttentionNeedle(filtered, p.needle) {
+			if isIntegrationApprovalNoise(filtered) {
+				continue
+			}
+			return true, p.msg
+		}
+	}
 	return false, ""
 }
 

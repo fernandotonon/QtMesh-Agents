@@ -10,6 +10,7 @@ It runs as a lightweight Go daemon that owns agent processes and PTYs. The CLI a
 
 - Unified CLI: `qma` (alias `qtmesh-agents`)
 - Persistent background daemon with Unix domain socket IPC
+- **Web workspace** (browser): benches/goals/chat/Needs you + live agent terminals — `qma web`
 - Interactive sessions with PTY attach/detach
 - Adapters for Claude Code, Codex, Cursor Agent, plus a mock agent for CI
 - SQLite persistence for projects, sessions, and events
@@ -84,7 +85,14 @@ qma attach <session-id>   # raw terminal; detach with the client exit
 
 # Or open the TUI
 qma
+
+# Web workspace (daemon HTTP — Bearer token; Tailscale-friendly bind)
+qma daemon start
+qma web                 # opens http://…/?token=…
+qma web token           # show / regenerate auth token
 ```
+
+See [docs/web-workspace.md](docs/web-workspace.md) for bind, Tailscale Serve, and restart notes.
 
 Inside the TUI:
 
@@ -106,20 +114,25 @@ See [examples/config.yaml](examples/config.yaml). Data and logs live under `~/.l
 ## Architecture
 
 ```text
-CLI / TUI  ──Unix socket──►  daemon (sessions, PTY, SQLite)
-                                 │
-                    Claude / Codex / Cursor / mock
+CLI / TUI  ──Unix socket──►  daemon (sessions, PTY, SQLite, HTTP/WS)
+Browser    ──Bearer HTTP──►        │
+                                   │
+                      Claude / Codex / Cursor / mock
 ```
 
-Details: [docs/architecture.md](docs/architecture.md)
+Details: [docs/architecture.md](docs/architecture.md) · [docs/web-workspace.md](docs/web-workspace.md)
 
 ## Development
 
 ```bash
+make web          # Vite SPA → internal/web/dist (embedded)
+make build-go     # binary only (uses existing dist)
 make test
 make vet
 go test ./...
 ```
+
+After `make install`, restart the daemon so it loads the new binary (`qma daemon stop && qma daemon start`).
 
 CI uses the mock adapter so no paid provider credentials are required.
 

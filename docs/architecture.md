@@ -9,23 +9,27 @@
 QtMesh Agents is a terminal-first orchestrator for multi-vendor AI coding agents. A persistent background daemon owns agent processes and PTYs. CLI and TUI clients connect over local IPC and never own agent lifetimes.
 
 ```text
-┌─────────────┐   ┌─────────────┐
-│  qma (CLI)  │   │  qma (TUI)  │
-└──────┬──────┘   └──────┬──────┘
-       │  Unix socket / named pipe
-       └──────────┬──────┘
-                  ▼
-         ┌────────────────┐
-         │  qma daemon    │
-         │  sessions/PTY  │
-         │  orchestrator  │
-         │  SQLite store  │
-         └───────┬────────┘
-                 │
-    ┌────────────┼────────────┐
-    ▼            ▼            ▼
- Claude CLI   Codex CLI   Cursor Agent
+┌─────────────┐   ┌─────────────┐   ┌──────────────┐
+│  qma (CLI)  │   │  qma (TUI)  │   │ Browser SPA  │
+└──────┬──────┘   └──────┬──────┘   └──────┬───────┘
+       │  Unix socket         │             │ HTTP/WS + Bearer
+       └──────────┬───────────┘             │
+                  └────────────┬────────────┘
+                               ▼
+                      ┌────────────────┐
+                      │  qma daemon    │
+                      │  sessions/PTY  │
+                      │  orchestrator  │
+                      │  SQLite store  │
+                      │  web gateway   │
+                      └───────┬────────┘
+                              │
+                 ┌────────────┼────────────┐
+                 ▼            ▼            ▼
+          Claude CLI   Codex CLI   Cursor Agent
 ```
+
+Web workspace details: [web-workspace.md](web-workspace.md).
 
 ## Design principles
 
@@ -47,9 +51,15 @@ Top orchestrator (conductor)
         └── Worker agents (implement / test / review)
 ```
 
-- Starting a run calls `EnsureBench` — seats a leader (prefer Claude) and detected workers.
+- Starting a run calls `EnsureBench` — seats a leader (`routing.leadershipFallback`,
+  default Claude → Cursor → Codex) and detected workers. If the seated leader hits
+  quota/token exhaustion, the next available entry is reseated automatically.
 - Plans begin with a `lead` (leadership) task, then discover → impl → verify → integrate.
-- Codex workers run with `approval_policy=never` + `--sandbox workspace-write` (unattended).
+- Codex workers run with `approval_policy=never` (unattended). Default sandbox is
+  `danger-full-access` so local GPU tools (qtmesh/TRELLIS/Metal) work; `workspace-write`
+  seatbelt blocks OpenGL (`CGLDescribeRenderer` / exit 139) and used to stall on fake
+  “needs graphics session” prompts. If a worker still hits a GPU sandbox block, the
+  executor auto-retries once with elevated sandbox instead of asking the human.
   (`--approve-for-me` alone leaves `approval: on-request`, which hangs when Codex is configured
   with `approvals_reviewer=user` — waiting for ChatGPT app confirmation we never surface.)
 - Agent stdout is streamed; permission/auth prompts raise a ⚠ mid-run (not only after timeout).
@@ -63,6 +73,9 @@ Category preferences select Cursor for implementation, Codex for frontend and te
 and Claude for architecture and review. Preferences take priority over the shared
 fallback order (`codex`, `claude`, `cursor`), which remains unchanged to preserve
 behavior for other categories when their preferred agent is unavailable.
+Quota/token exhaustion (e.g. Claude "credit balance is too low") marks that vendor
+exhausted for the daemon process and retries via `routing.fallback`; leadership
+reseats along `routing.leadershipFallback` (`claude`, `cursor`, `codex`).
 
 After changing `~/.config/qtmesh-agents/config.yaml`, the daemon may need a restart
 or reload for live routing to use the new preferences on new runs.

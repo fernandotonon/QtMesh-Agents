@@ -24,6 +24,7 @@ import (
 	"github.com/fernandotonon/QtMesh-Agents/internal/projects"
 	"github.com/fernandotonon/QtMesh-Agents/internal/sessions"
 	"github.com/fernandotonon/QtMesh-Agents/internal/storage"
+	"github.com/fernandotonon/QtMesh-Agents/internal/web"
 	"github.com/fernandotonon/QtMesh-Agents/pkg/version"
 )
 
@@ -38,6 +39,7 @@ type Daemon struct {
 	conductor *orchestrator.Conductor
 	socket    string
 	ln        net.Listener
+	web       *web.Server
 	log       *slog.Logger
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -145,6 +147,14 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		opts.Logger.Info("orchestrator agent", "provider", provider)
 	}
 	conductor := orchestrator.NewConductor(orch, proj, chatAdapter)
+	orch.OnAttentionResolved = func(ctx context.Context, a storage.Attention) {
+		if a.GoalID == "" {
+			return
+		}
+		if err := conductor.ResumeBenchGoal(ctx, a.GoalID, ""); err != nil {
+			opts.Logger.Warn("resume bench goal after attention", "goal", a.GoalID, "err", err)
+		}
+	}
 
 	lockFile, err := acquireInstanceLock(socket)
 	if err != nil {
@@ -176,6 +186,43 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		cancel:    cancel,
 		lockFile:  lockFile,
 	}
+
+	webSrv, err := web.Start(runCtx, web.Deps{
+		Config:    cfg,
+		Store:     store,
+		Sessions:  mgr,
+		Projects:  proj,
+		Orch:      orch,
+		Conductor: conductor,
+		Registry:  reg,
+		Logger:    opts.Logger,
+		PersistToken: func(token string) error {
+			path, err := config.Path()
+			if err != nil {
+				return err
+			}
+			cur, err := config.Load(path)
+			if err != nil {
+				return err
+			}
+			cur.Daemon.HTTPAuthToken = token
+			cur.Daemon.HTTPEnabled = true
+			if cur.Daemon.HTTPListen == "" {
+				cur.Daemon.HTTPListen = cfg.Daemon.HTTPListen
+			}
+			return config.Save(path, cur)
+		},
+	})
+	if err != nil {
+		cancel()
+		_ = ln.Close()
+		if lockFile != nil {
+			_ = lockFile.Close()
+		}
+		_ = store.Close()
+		return nil, fmt.Errorf("web workspace: %w", err)
+	}
+	d.web = webSrv
 
 	_ = d.recordEvent(runCtx, events.New(events.KindDaemonStarted, "daemon started"))
 
@@ -527,14 +574,20 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 					pid = b.ProjectID
 				}
 			}
-			reply, err := d.conductor.AskLeader(ctx, pid, req.Message, refs)
+			res, err := d.conductor.LeaderTurn(ctx, pid, req.Message, refs)
 			if err != nil {
 				d.writeErr(codec, env.ID, err)
 				continue
 			}
+			actions := make([]ipc.ChatActionInfo, 0, len(res.Actions))
+			for _, a := range res.Actions {
+				actions = append(actions, ipc.ChatActionInfo{
+					Type: a.Type, ProjectID: a.ProjectID, Objective: a.Objective, RunID: a.RunID,
+				})
+			}
 			_ = codec.Write(ipc.Envelope{
 				Type: ipc.TypeLeaderConsultResp, ID: env.ID,
-				Payload: ipc.MustPayload(ipc.LeaderConsultResponse{Reply: reply}),
+				Payload: ipc.MustPayload(ipc.LeaderConsultResponse{Reply: res.Reply, Actions: actions}),
 			})
 		case ipc.TypeChatHistory:
 			hist := d.conductor.History()
@@ -583,6 +636,20 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 				continue
 			}
 			_ = codec.Write(ipc.Envelope{Type: ipc.TypeOK, ID: env.ID})
+		case ipc.TypeRunResume:
+			req, err := ipc.DecodePayload[ipc.RunRef](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			if err := d.orch.ResumeIncompleteRun(ctx, req.RunID); err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{
+				Type: ipc.TypeRunResumeResp, ID: env.ID,
+				Payload: ipc.MustPayload(ipc.RunStartResponse{RunID: req.RunID}),
+			})
 		case ipc.TypeAttentionList:
 			list, err := d.orch.ListOpenAttention(ctx)
 			if err != nil {
@@ -593,7 +660,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			for _, a := range list {
 				infos = append(infos, ipc.AttentionInfo{
 					ID: a.ID, ProjectID: a.ProjectID, BenchID: a.BenchID, RunID: a.RunID,
-					TaskID: a.TaskID, SessionID: a.SessionID, AgentID: a.AgentID,
+					TaskID: a.TaskID, SessionID: a.SessionID, AgentID: a.AgentID, GoalID: a.GoalID,
 					Kind: a.Kind, Message: a.Message, Status: a.Status,
 					CreatedAt: a.CreatedAt.Format(time.RFC3339),
 				})
@@ -637,12 +704,96 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 				for _, m := range members {
 					ids = append(ids, m.AgentID)
 				}
-				infos = append(infos, ipc.BenchInfo{
+				info := ipc.BenchInfo{
 					ID: b.ID, ProjectID: b.ProjectID, Name: b.Name,
 					LeaderAgentID: b.LeaderAgentID, Status: b.Status, Members: ids,
-				})
+				}
+				if g, gerr := d.store.LatestBenchGoal(ctx, b.ProjectID); gerr == nil {
+					info.GoalID = g.ID
+					info.GoalStatus = g.Status
+					info.GoalObjective = g.Objective
+					info.GoalIteration = g.Iteration
+					if msgs, merr := d.store.ListThreadMessages(ctx, g.ThreadID, 4); merr == nil {
+						for _, m := range msgs {
+							info.ThreadPreview = append(info.ThreadPreview, ipc.ThreadMsgInfo{
+								Role: m.Role, AgentID: m.AgentID,
+								Content: truncateStr(m.Content, 80),
+								CreatedAt: m.CreatedAt.UTC().Format(time.RFC3339),
+							})
+						}
+					}
+				}
+				infos = append(infos, info)
 			}
 			_ = codec.Write(ipc.Envelope{Type: ipc.TypeBenchListResp, ID: env.ID, Payload: ipc.MustPayload(infos)})
+		case ipc.TypeGoalStart:
+			req, err := ipc.DecodePayload[ipc.GoalStartRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			goalID, err := d.conductor.StartBenchGoal(ctx, req.ProjectID, req.Objective, req.AgentOverride)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeGoalStartResp, ID: env.ID, Payload: ipc.MustPayload(ipc.GoalStartResponse{GoalID: goalID})})
+		case ipc.TypeGoalStatus:
+			req, err := ipc.DecodePayload[ipc.GoalStatusRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			var g storage.BenchGoal
+			if req.GoalID != "" {
+				g, err = d.store.GetBenchGoal(ctx, req.GoalID)
+			} else if req.ProjectID != "" {
+				g, err = d.store.LatestBenchGoal(ctx, req.ProjectID)
+			} else {
+				d.writeErr(codec, env.ID, fmt.Errorf("goal_id or project_id required"))
+				continue
+			}
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeGoalStatusResp, ID: env.ID, Payload: ipc.MustPayload(ipc.GoalStatusResponse{
+				GoalID: g.ID, ProjectID: g.ProjectID, BenchID: g.BenchID, Objective: g.Objective,
+				Status: g.Status, Iteration: g.Iteration, RunID: g.RunID, Error: g.Error, ThreadID: g.ThreadID,
+			})})
+		case ipc.TypeThreadList:
+			req, err := ipc.DecodePayload[ipc.ThreadListRequest](env.Payload)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			threadID := req.ThreadID
+			if threadID == "" && req.ProjectID != "" {
+				if g, gerr := d.store.LatestBenchGoal(ctx, req.ProjectID); gerr == nil {
+					threadID = g.ThreadID
+				}
+			}
+			if threadID == "" {
+				d.writeErr(codec, env.ID, fmt.Errorf("thread_id or project_id required"))
+				continue
+			}
+			limit := req.Limit
+			if limit <= 0 {
+				limit = 30
+			}
+			msgs, err := d.store.ListThreadMessages(ctx, threadID, limit)
+			if err != nil {
+				d.writeErr(codec, env.ID, err)
+				continue
+			}
+			out := make([]ipc.ThreadMsgInfo, 0, len(msgs))
+			for _, m := range msgs {
+				out = append(out, ipc.ThreadMsgInfo{
+					Role: m.Role, AgentID: m.AgentID, Content: m.Content,
+					CreatedAt: m.CreatedAt.UTC().Format(time.RFC3339),
+				})
+			}
+			_ = codec.Write(ipc.Envelope{Type: ipc.TypeThreadListResp, ID: env.ID, Payload: ipc.MustPayload(out)})
 		default:
 			d.writeErr(codec, env.ID, fmt.Errorf("unknown type %q", env.Type))
 		}
@@ -782,6 +933,11 @@ func (d *Daemon) Stop() {
 	d.log.Info("daemon stopping")
 	_ = d.recordEvent(context.Background(), events.New(events.KindDaemonStopped, "daemon stopped"))
 	d.cancel()
+	if d.web != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = d.web.Shutdown(ctx)
+		cancel()
+	}
 	_ = d.ln.Close()
 	done := make(chan struct{})
 	go func() {
@@ -798,6 +954,30 @@ func (d *Daemon) Stop() {
 		_ = d.lockFile.Close()
 		d.lockFile = nil
 	}
+}
+
+// WebURL returns the workspace URL when HTTP is enabled.
+func (d *Daemon) WebURL() string {
+	if d.web == nil {
+		return ""
+	}
+	return d.web.URL()
+}
+
+// WebToken returns the HTTP bearer token when the web server is running.
+func (d *Daemon) WebToken() string {
+	if d.web == nil {
+		return ""
+	}
+	return d.web.Token()
+}
+
+func truncateStr(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
 
 // SocketPath returns the listening socket.

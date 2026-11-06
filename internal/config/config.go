@@ -49,10 +49,14 @@ type ExecutionConfig struct {
 }
 
 type RoutingConfig struct {
-	Strategy           string            `yaml:"strategy"`
-	Preferences        map[string]string `yaml:"preferences"`
-	Fallback           []string          `yaml:"fallback"`
-	MaxConcurrentAgents int              `yaml:"maxConcurrentAgents"`
+	Strategy            string            `yaml:"strategy"`
+	Preferences         map[string]string `yaml:"preferences"`
+	Fallback            []string          `yaml:"fallback"`
+	// LeadershipFallback is the ordered preference for the project bench leader
+	// (and AskLeader consults). When the seated leader hits quota/token exhaustion,
+	// the next available entry takes over. Default: claude → cursor → codex.
+	LeadershipFallback  []string          `yaml:"leadershipFallback"`
+	MaxConcurrentAgents int               `yaml:"maxConcurrentAgents"`
 }
 
 type StorageConfig struct {
@@ -66,8 +70,11 @@ type UIConfig struct {
 }
 
 type DaemonConfig struct {
-	SocketPath string `yaml:"socketPath,omitempty"`
-	LogPath    string `yaml:"logPath,omitempty"`
+	SocketPath    string `yaml:"socketPath,omitempty"`
+	LogPath       string `yaml:"logPath,omitempty"`
+	HTTPEnabled   bool   `yaml:"httpEnabled"`
+	HTTPListen    string `yaml:"httpListen,omitempty"`    // e.g. 0.0.0.0:7432 or 100.x:7432
+	HTTPAuthToken string `yaml:"httpAuthToken,omitempty"` // empty => auto-generate when HTTP enabled
 }
 
 // Default returns a sensible default configuration.
@@ -80,7 +87,7 @@ func Default() Config {
 		},
 		Agents: AgentsConfig{
 			Claude: AgentEntry{Enabled: true, Command: "claude", PermissionMode: "acceptEdits"},
-			Codex:  AgentEntry{Enabled: true, Command: "codex", Sandbox: "workspace-write", ApproveForMe: true},
+			Codex:  AgentEntry{Enabled: true, Command: "codex", Sandbox: "danger-full-access", ApproveForMe: true},
 			Cursor: AgentEntry{Enabled: true, Command: "cursor-agent"},
 			Mock:   AgentEntry{Enabled: true, Command: "qma-mock-agent"},
 		},
@@ -101,10 +108,15 @@ func Default() Config {
 				"review":         "claude",
 			},
 			Fallback:            []string{"codex", "claude", "cursor"},
+			LeadershipFallback:  []string{"claude", "cursor", "codex"},
 			MaxConcurrentAgents: 3,
 		},
 		Storage: StorageConfig{Driver: "sqlite"},
 		UI:      UIConfig{Theme: "dark", ShowUsage: true},
+		Daemon: DaemonConfig{
+			HTTPEnabled: true,
+			HTTPListen:  "0.0.0.0:7432",
+		},
 	}
 }
 

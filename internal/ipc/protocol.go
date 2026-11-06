@@ -42,6 +42,8 @@ const (
 	TypeRunList       = "run_list"
 	TypeRunListResp   = "run_list_resp"
 	TypeRunCancel     = "run_cancel"
+	TypeRunResume     = "run_resume"
+	TypeRunResumeResp = "run_resume_resp"
 	TypeChat            = "chat"
 	TypeChatResp        = "chat_resp"
 	TypeChatHistory     = "chat_history"
@@ -55,6 +57,12 @@ const (
 	TypeBenchList       = "bench_list"
 	TypeBenchListResp   = "bench_list_resp"
 	TypeTaskReply       = "task_reply"
+	TypeGoalStart       = "goal_start"
+	TypeGoalStartResp   = "goal_start_resp"
+	TypeGoalStatus      = "goal_status"
+	TypeGoalStatusResp  = "goal_status_resp"
+	TypeThreadList      = "thread_list"
+	TypeThreadListResp  = "thread_list_resp"
 )
 
 // Envelope is a length-prefixed JSON message.
@@ -297,6 +305,7 @@ type AttentionInfo struct {
 	TaskID    string `json:"task_id,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	AgentID   string `json:"agent_id,omitempty"`
+	GoalID    string `json:"goal_id,omitempty"`
 	Kind      string `json:"kind"`
 	Message   string `json:"message"`
 	Status    string `json:"status"`
@@ -314,6 +323,52 @@ type BenchInfo struct {
 	LeaderAgentID string   `json:"leader_agent_id,omitempty"`
 	Status        string   `json:"status"`
 	Members       []string `json:"members,omitempty"`
+	// Durable goal + thread preview (Bee-like task loop).
+	GoalID         string           `json:"goal_id,omitempty"`
+	GoalStatus     string           `json:"goal_status,omitempty"`
+	GoalObjective  string           `json:"goal_objective,omitempty"`
+	GoalIteration  int              `json:"goal_iteration,omitempty"`
+	ThreadPreview  []ThreadMsgInfo  `json:"thread_preview,omitempty"`
+}
+
+type ThreadMsgInfo struct {
+	Role      string `json:"role"`
+	AgentID   string `json:"agent_id,omitempty"`
+	Content   string `json:"content"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+type GoalStartRequest struct {
+	ProjectID string `json:"project_id"`
+	Objective string `json:"objective"`
+	AgentOverride string `json:"agent_override,omitempty"`
+}
+
+type GoalStartResponse struct {
+	GoalID string `json:"goal_id"`
+}
+
+type GoalStatusRequest struct {
+	ProjectID string `json:"project_id,omitempty"`
+	GoalID    string `json:"goal_id,omitempty"`
+}
+
+type GoalStatusResponse struct {
+	GoalID        string `json:"goal_id,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
+	BenchID       string `json:"bench_id,omitempty"`
+	Objective     string `json:"objective,omitempty"`
+	Status        string `json:"status,omitempty"`
+	Iteration     int    `json:"iteration,omitempty"`
+	RunID         string `json:"run_id,omitempty"`
+	Error         string `json:"error,omitempty"`
+	ThreadID      string `json:"thread_id,omitempty"`
+}
+
+type ThreadListRequest struct {
+	ProjectID string `json:"project_id,omitempty"`
+	ThreadID  string `json:"thread_id,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 type ChatRequest struct {
@@ -329,7 +384,8 @@ type LeaderConsultRequest struct {
 }
 
 type LeaderConsultResponse struct {
-	Reply string `json:"reply"`
+	Reply   string           `json:"reply"`
+	Actions []ChatActionInfo `json:"actions,omitempty"`
 }
 
 type ChatActionInfo struct {

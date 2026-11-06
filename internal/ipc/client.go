@@ -288,6 +288,14 @@ func (c *Client) RunCancel(runID string) error {
 	return err
 }
 
+func (c *Client) RunResume(runID string) (RunStartResponse, error) {
+	resp, err := c.roundTrip(TypeRunResume, RunRef{RunID: runID})
+	if err != nil {
+		return RunStartResponse{}, err
+	}
+	return DecodePayload[RunStartResponse](resp.Payload)
+}
+
 func (c *Client) Chat(message string) (ChatResponse, error) {
 	return c.ChatOpts(ChatRequest{Message: message})
 }
@@ -351,6 +359,30 @@ func (c *Client) BenchList() ([]BenchInfo, error) {
 		return nil, err
 	}
 	return DecodePayload[[]BenchInfo](resp.Payload)
+}
+
+func (c *Client) GoalStart(req GoalStartRequest) (GoalStartResponse, error) {
+	resp, err := c.roundTrip(TypeGoalStart, req)
+	if err != nil {
+		return GoalStartResponse{}, err
+	}
+	return DecodePayload[GoalStartResponse](resp.Payload)
+}
+
+func (c *Client) GoalStatus(req GoalStatusRequest) (GoalStatusResponse, error) {
+	resp, err := c.roundTrip(TypeGoalStatus, req)
+	if err != nil {
+		return GoalStatusResponse{}, err
+	}
+	return DecodePayload[GoalStatusResponse](resp.Payload)
+}
+
+func (c *Client) ThreadList(req ThreadListRequest) ([]ThreadMsgInfo, error) {
+	resp, err := c.roundTrip(TypeThreadList, req)
+	if err != nil {
+		return nil, err
+	}
+	return DecodePayload[[]ThreadMsgInfo](resp.Payload)
 }
 
 // ReadEnvelope is deprecated; use Outputs().

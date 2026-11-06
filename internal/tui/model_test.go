@@ -242,7 +242,7 @@ func TestOrchChatShowsLatest(t *testing.T) {
 	}
 	m.orchLog = appendOrchTurn(m.orchLog, "you", "final question")
 	m.orchLog = appendOrchTurn(m.orchLog, "orch", "FINAL_REPLY_VISIBLE")
-	m.syncOrchView()
+	m.syncOrchViewOpts(true)
 	view := m.View()
 	if !strings.Contains(view, "FINAL_REPLY_VISIBLE") {
 		t.Fatalf("expected latest orch reply in view:\n%s", view)
@@ -250,6 +250,33 @@ func TestOrchChatShowsLatest(t *testing.T) {
 	lines := strings.Split(view, "\n")
 	if len(lines) > m.height {
 		t.Fatalf("view height %d > terminal %d", len(lines), m.height)
+	}
+}
+
+func TestOrchChatPreservesScrollWhenNotAtBottom(t *testing.T) {
+	m := New(nil)
+	m.ready = true
+	m.width = 80
+	m.height = 20
+	m.layout()
+	for i := 0; i < 50; i++ {
+		m.orchLog = appendOrchTurn(m.orchLog, "orch", fmt.Sprintf("history-line-%02d", i))
+	}
+	m.syncOrchViewOpts(true)
+	if !m.orchView.AtBottom() {
+		t.Fatal("expected at bottom after pin")
+	}
+	m.orchView.GotoTop()
+	if m.orchView.AtBottom() {
+		t.Fatal("expected scrolled away from bottom")
+	}
+	y := m.orchView.YOffset
+	m.syncOrchView() // layout-style refresh must not wipe scroll
+	if m.orchView.YOffset != y {
+		t.Fatalf("scroll reset: YOffset %d → %d", y, m.orchView.YOffset)
+	}
+	if m.orchView.AtBottom() {
+		t.Fatal("syncOrchView without force should not jump to bottom")
 	}
 }
 

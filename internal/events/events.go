@@ -22,6 +22,7 @@ const (
 	KindAttentionRaised    Kind = "attention.raised"
 	KindAttentionResolved  Kind = "attention.resolved"
 	KindBenchOpened        Kind = "bench.opened"
+	KindLeaderReseated     Kind = "bench.leader_reseated"
 	KindDaemonStarted      Kind = "daemon.started"
 	KindDaemonStopped      Kind = "daemon.stopped"
 	KindError              Kind = "error"

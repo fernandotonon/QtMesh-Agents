@@ -44,12 +44,44 @@ func (m *Manager) Create(ctx context.Context, taskID, branch string) (string, er
 		_ = m.Remove(ctx, dir)
 		return "", err
 	}
+	// Record the synced user state as a tree, without creating a commit.
+	// Task diffs must exclude pre-existing changes and include agent commits.
+	if out, err := exec.CommandContext(ctx, "git", "-C", dir, "add", "-A").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("snapshot add: %w (%s)", err, out)
+	}
+	tree, err := exec.CommandContext(ctx, "git", "-C", dir, "write-tree").Output()
+	if err != nil {
+		return "", fmt.Errorf("snapshot tree: %w", err)
+	}
+	baseline, err := baselinePath(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(baseline, []byte(strings.TrimSpace(string(tree))), 0o600); err != nil {
+		return "", err
+	}
 	return dir, nil
 }
 
 // SyncWorkingTree copies the main working tree into dest, preserving the
 // destination's .git worktree link. This includes untracked and uncommitted files.
 func SyncWorkingTree(src, dest string) error {
+	// A copy alone would resurrect tracked files deleted in the user's checkout.
+	deleted, err := exec.Command("git", "-C", src, "diff", "--name-only", "--diff-filter=D", "-z", "HEAD").Output()
+	if err != nil {
+		return fmt.Errorf("list source deletions: %w", err)
+	}
+	for _, rel := range strings.Split(string(deleted), "\x00") {
+		if rel == "" {
+			continue
+		}
+		if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, "../") {
+			return fmt.Errorf("invalid deleted path %q", rel)
+		}
+		if err := os.Remove(filepath.Join(dest, rel)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	if _, err := exec.LookPath("rsync"); err == nil {
 		args := []string{
 			"-a",
@@ -142,7 +174,7 @@ func ValidateWorktree(src, dest string) error {
 	return nil
 }
 
-// Diff returns a unified diff of all changes in the worktree versus HEAD,
+// Diff returns a binary-capable unified diff versus the initial user snapshot,
 // including previously untracked files.
 func (m *Manager) Diff(ctx context.Context, worktreePath string) (string, error) {
 	// Stage everything so untracked files appear in the diff without committing.
@@ -150,7 +182,17 @@ func (m *Manager) Diff(ctx context.Context, worktreePath string) (string, error)
 	if out, err := add.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git add: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "diff", "--cached", "HEAD")
+	var base string
+	path, err := baselinePath(ctx, worktreePath)
+	if err != nil {
+		return "", err
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		base = strings.TrimSpace(string(b))
+	} else {
+		return "", fmt.Errorf("task baseline unavailable; start a new run: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "diff", "--binary", "--cached", base)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -175,4 +217,12 @@ func sanitize(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func baselinePath(ctx context.Context, dir string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(strings.TrimSpace(string(out)), "qma-baseline"), nil
 }

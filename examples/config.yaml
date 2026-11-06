@@ -12,6 +12,10 @@ agents:
   codex:
     enabled: true
     command: codex
+    # Use danger-full-access on GPU workstations (qtmesh/TRELLIS need Metal/OpenGL).
+    # workspace-write seatbelt blocks graphics and surfaces false "needs graphics" stalls.
+    sandbox: danger-full-access
+    approveForMe: true
   cursor:
     enabled: true
     command: cursor-agent
@@ -37,6 +41,12 @@ routing:
     - codex
     - claude
     - cursor
+  # Bench leader / AskLeader chain. On quota/token exhaustion the next
+  # available entry is reseated (claude → cursor → codex).
+  leadershipFallback:
+    - claude
+    - cursor
+    - codex
   maxConcurrentAgents: 3
 
 storage:
@@ -45,3 +55,12 @@ storage:
 ui:
   theme: dark
   showUsage: true
+
+daemon:
+  # Web workspace (browser SPA + REST/WS). Closing the tab never kills agents.
+  httpEnabled: true
+  # Bind: localhost, Tailscale IP (100.x), or 0.0.0.0 for LAN/Tailscale.
+  httpListen: "0.0.0.0:7432"
+  # Empty => daemon auto-generates on first start and writes it back here.
+  # Show with: qma web token   | open UI: qma web
+  httpAuthToken: ""

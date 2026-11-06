@@ -2,6 +2,26 @@ package orchestrator
 
 import "testing"
 
+func TestLooksLikeGraphicsSandboxBlock(t *testing.T) {
+	cases := []struct {
+		out  string
+		want bool
+	}{
+		{"can this task run with graphics/gpu access? qtmesh crashes before generation in this sandbox (exit 139, `cgldescriberenderer`)", true},
+		{"this worker still lacks graphics access. can it be rerun in a graphics-enabled session?", true},
+		{"what is the connection address and access method for the graphics-enabled qtmesh runner?", true},
+		{"NEEDS_HUMAN: elevated sandbox required for GPU", true},
+		{"Implemented the feature successfully", false},
+		{"Waiting for approval to continue", false},
+	}
+	for _, tc := range cases {
+		ok, _ := looksLikeGraphicsSandboxBlock(tc.out)
+		if ok != tc.want {
+			t.Fatalf("out=%q want=%v got=%v", tc.out, tc.want, ok)
+		}
+	}
+}
+
 func TestLooksLikeNeedsAttention(t *testing.T) {
 	ok, msg := looksLikeNeedsAttention("Waiting for approval to continue", 1)
 	if !ok || msg == "" {

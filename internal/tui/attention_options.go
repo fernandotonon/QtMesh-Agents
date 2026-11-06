@@ -78,6 +78,15 @@ func contextualDefaults(contextBlob string, task *ipc.TaskInfo) []replyOption {
 	case strings.Contains(blob, "apply to main working tree") || strings.Contains(blob, "approve apply") ||
 		strings.Contains(blob, "reject leave worktree") || strings.Contains(blob, "ready to apply worktree"):
 		return mergeApprovalOptions()
+	case strings.Contains(blob, "graphics") || strings.Contains(blob, "gpu") ||
+		strings.Contains(blob, "cgldescribe") || strings.Contains(blob, "qtmesh crashes") ||
+		strings.Contains(blob, "opengl") || strings.Contains(blob, "elevated sandbox required for gpu"):
+		return []replyOption{
+			{Label: "Grant full sandbox (GPU/Metal) & retry on this Mac", Reply: "Human reply: Elevated sandbox granted. This Mac has full GPU — rerun qtmesh/TRELLIS locally; do not ask for a remote graphics runner.", Action: "reply", ElevateSandbox: true},
+			{Label: "Skip this task", Reply: "Human reply: Skip this task. Do not make further changes; summarize and exit.", Action: "reply"},
+			{Label: "Type a custom reply…", Action: "custom"},
+			{Label: "Dismiss warning only (do not resume)", Action: "dismiss"},
+		}
 	case strings.Contains(blob, "authrequired(") || strings.Contains(blob, "oauth") ||
 		strings.Contains(blob, "www-authenticate") || strings.Contains(blob, "please sign in") ||
 		strings.Contains(blob, "please login"):

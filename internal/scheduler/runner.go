@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
 )
 
 // ErrNeedsAttention signals the task paused for human input (permissions, approval).
@@ -20,137 +18,113 @@ func RunDAG(ctx context.Context, tasks []Task, maxConcurrent int, fn TaskFunc) e
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	byID := map[string]*Task{}
+	// Workers own private task copies. Only this event loop mutates the DAG.
+	byID := map[string]int{}
 	for i := range tasks {
-		byID[tasks[i].ID] = &tasks[i]
+		if tasks[i].ID == "" {
+			return fmt.Errorf("empty task id")
+		}
+		if _, exists := byID[tasks[i].ID]; exists {
+			return fmt.Errorf("duplicate task id %q", tasks[i].ID)
+		}
+		byID[tasks[i].ID] = i
 		if tasks[i].Status == "" {
 			tasks[i].Status = StatusPending
 		}
 	}
-
-	var (
-		mu       sync.Mutex
-		wg       sync.WaitGroup
-		sem      = make(chan struct{}, maxConcurrent)
-		firstErr error
-		running  = map[string]bool{}
-	)
-
+	for _, t := range tasks {
+		for _, dep := range t.Dependencies {
+			if _, ok := byID[dep]; !ok {
+				return fmt.Errorf("unknown dependency %q", dep)
+			}
+		}
+	}
+	if err := detectCycles(tasks); err != nil {
+		return err
+	}
+	type completion struct {
+		task Task
+		err  error
+	}
+	done := make(chan completion, maxConcurrent)
+	running := 0
+	var firstErr error
+	cancelled := false
 	for {
 		if ctx.Err() != nil {
-			mu.Lock()
-			for i := range tasks {
-				switch tasks[i].Status {
-				case StatusPending, StatusReady, StatusRunning:
-					tasks[i].Status = StatusCancelled
+			cancelled = true
+		}
+		if !cancelled {
+			for _, ready := range ReadyTasks(tasks) {
+				if running >= maxConcurrent {
+					break
 				}
+				i := byID[ready.ID]
+				tasks[i].Status = StatusRunning
+				worker := tasks[i]
+				worker.Dependencies = append([]string(nil), worker.Dependencies...)
+				worker.Acceptance = append([]string(nil), worker.Acceptance...)
+				running++
+				go func(t Task) { err := fn(ctx, &t); done <- completion{t, err} }(worker)
 			}
-			mu.Unlock()
-			wg.Wait()
-			return ctx.Err()
 		}
-
-		mu.Lock()
-		snapshot := make([]Task, len(tasks))
-		copy(snapshot, tasks)
-		inflight := len(running)
-		mu.Unlock()
-
-		if AllTerminal(snapshot) {
-			wg.Wait()
-			mu.Lock()
-			err := firstErr
-			mu.Unlock()
-			if !Succeeded(snapshot) && err == nil {
-				err = fmt.Errorf("orchestration incomplete")
-			}
-			return err
-		}
-
-		ready := ReadyTasks(snapshot)
-		started := 0
-		for _, r := range ready {
-			mu.Lock()
-			t := byID[r.ID]
-			if running[t.ID] || t.Status == StatusRunning || t.Status == StatusSucceeded ||
-				t.Status == StatusFailed || t.Status == StatusAwaitingInput {
-				mu.Unlock()
-				continue
-			}
-			t.Status = StatusRunning
-			running[t.ID] = true
-			taskPtr := t
-			mu.Unlock()
-
-			started++
-			wg.Add(1)
-			go func(tp *Task) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				err := fn(ctx, tp)
-
-				mu.Lock()
-				delete(running, tp.ID)
-				if err != nil {
-					if errors.Is(err, ErrNeedsAttention) || tp.Status == StatusAwaitingInput {
-						tp.Status = StatusAwaitingInput
-						if tp.Error == "" {
-							tp.Error = err.Error()
-						}
-						// Soft: do not treat as hard firstErr so the run can surface needs_attention.
-					} else if tp.Status != StatusSucceeded {
-						tp.Status = StatusFailed
-						if tp.Error == "" {
-							tp.Error = err.Error()
-						}
-						if firstErr == nil {
-							firstErr = err
-						}
+		if running == 0 {
+			if cancelled {
+				for i := range tasks {
+					if tasks[i].Status == StatusPending || tasks[i].Status == StatusReady {
+						tasks[i].Status = StatusCancelled
 					}
-				} else if tp.Status == StatusRunning || tp.Status == "" {
-					tp.Status = StatusSucceeded
 				}
-				mu.Unlock()
-			}(taskPtr)
+				return ctx.Err()
+			}
+			if NeedsAttention(tasks) {
+				return firstErr
+			}
+			if Succeeded(tasks) {
+				return nil
+			}
+			for i := range tasks {
+				if tasks[i].Status == StatusPending || tasks[i].Status == StatusReady {
+					tasks[i].Status = StatusBlocked
+				}
+			}
+			if firstErr != nil {
+				return firstErr
+			}
+			return fmt.Errorf("orchestration incomplete")
 		}
-
-		if started == 0 && inflight == 0 {
-			mu.Lock()
-			// Recheck under lock to avoid a scheduling race.
-			snap := make([]Task, len(tasks))
-			copy(snap, tasks)
-			if len(ReadyTasks(snap)) > 0 {
-				mu.Unlock()
+		var result completion
+		if cancelled {
+			result = <-done
+		} else {
+			select {
+			case result = <-done:
+			case <-ctx.Done():
+				cancelled = true
 				continue
 			}
-			blocked := false
-			failed := false
-			for i := range tasks {
-				switch tasks[i].Status {
-				case StatusFailed:
-					failed = true
-				case StatusPending, StatusReady:
-					tasks[i].Status = StatusBlocked
-					blocked = true
-				}
-			}
-			err := firstErr
-			mu.Unlock()
-			wg.Wait()
-			if blocked || failed {
-				if err == nil {
-					err = fmt.Errorf("tasks blocked by failed dependencies")
-				}
-				return err
-			}
-			return err
 		}
-
-		select {
-		case <-ctx.Done():
-		case <-time.After(20 * time.Millisecond):
+		running--
+		t := result.task
+		if ctx.Err() != nil {
+			t.Status = StatusCancelled
+			t.Error = ctx.Err().Error()
+		} else if errors.Is(result.err, ErrNeedsAttention) || t.Status == StatusAwaitingInput {
+			t.Status = StatusAwaitingInput
+			if result.err != nil && t.Error == "" {
+				t.Error = result.err.Error()
+			}
+		} else if result.err != nil {
+			t.Status = StatusFailed
+			if t.Error == "" {
+				t.Error = result.err.Error()
+			}
+			if firstErr == nil {
+				firstErr = result.err
+			}
+		} else if t.Status == StatusRunning || t.Status == "" {
+			t.Status = StatusSucceeded
 		}
+		tasks[byID[t.ID]] = t
 	}
 }

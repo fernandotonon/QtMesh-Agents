@@ -36,6 +36,7 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(newAttentionCmd())
 	root.AddCommand(newReviewCmd())
 	root.AddCommand(newMetricsCmd())
+	root.AddCommand(newWebCmd())
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newInitCmd())
 

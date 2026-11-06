@@ -112,7 +112,82 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 	if err := s.migrateReviewsAndMetrics(); err != nil {
 		return err
 	}
-	return s.ensureMigration(4)
+	if err := s.ensureMigration(4); err != nil {
+		return err
+	}
+	// Migration 5: bench work threads + durable goals (Bee-like task loop).
+	if err := s.migrateThreadsAndGoals(); err != nil {
+		return err
+	}
+	if err := s.ensureMigration(5); err != nil {
+		return err
+	}
+	// Migration 6: agent profiles for web workspace.
+	if err := s.migrateAgentProfiles(); err != nil {
+		return err
+	}
+	return s.ensureMigration(6)
+}
+
+func (s *Store) migrateAgentProfiles() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS agent_profiles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  role TEXT,
+  traits TEXT,
+  context TEXT,
+  project_id TEXT,
+  work_dir TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`)
+	return err
+}
+
+func (s *Store) migrateThreadsAndGoals() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS bench_threads (
+  id TEXT PRIMARY KEY,
+  bench_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bench_thread_messages (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  agent_id TEXT,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_thread_messages_thread ON bench_thread_messages(thread_id, created_at);
+CREATE TABLE IF NOT EXISTS bench_goals (
+  id TEXT PRIMARY KEY,
+  bench_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  status TEXT NOT NULL,
+  iteration INTEGER NOT NULL DEFAULT 0,
+  run_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_goals_project ON bench_goals(project_id, updated_at);
+`)
+	if err != nil {
+		return err
+	}
+	if !s.columnExists("attention", "goal_id") {
+		if _, err := s.db.Exec(`ALTER TABLE attention ADD COLUMN goal_id TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) migrateReviewsAndMetrics() error {

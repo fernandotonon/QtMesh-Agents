@@ -27,28 +27,52 @@ type agentTurn struct {
 }
 
 // agenticChat runs a tool-using orchestrator loop with the conversational adapter
-// (Cursor preferred). Falls back to interpret/heuristic when the adapter is missing.
+// (Cursor preferred). On quota/token exhaustion it fails over cursor → claude → codex.
+// Falls back to interpret/heuristic when no adapter is usable.
 func (c *Conductor) agenticChat(ctx context.Context, userText string, refs []ProjectRef, focusProjectID string) (ChatResult, error) {
-	if c.adapter == nil {
+	adapters := c.orchChatAdapters(ctx)
+	if len(adapters) == 0 {
 		return ChatResult{}, fmt.Errorf("no orch agent adapter")
-	}
-	ok, err := c.adapter.Detect(ctx)
-	if err != nil || !ok {
-		return ChatResult{}, fmt.Errorf("orch agent unavailable")
 	}
 
 	var trace []string
 	briefing := c.gatherWorkBriefing(ctx, refs, focusProjectID)
 	var last agentTurn
+	adapterIdx := 0
+	adapter := adapters[adapterIdx]
 
 	for i := 0; i < orchAgentMaxIters; i++ {
 		prompt := c.orchAgentPrompt(userText, refs, focusProjectID, briefing, trace, i)
-		execRes, err := c.adapter.Execute(ctx, agents.AgentTask{
+		execRes, err := adapter.Execute(ctx, agents.AgentTask{
 			ID:          fmt.Sprintf("orch-agent-%d-%d", time.Now().UnixNano(), i),
 			Description: "QtMesh orchestrator agent turn",
 			Prompt:      prompt,
 			Timeout:     4 * time.Minute,
 		})
+		combined := execRes.Output
+		if err != nil {
+			combined = err.Error() + "\n" + execRes.Output
+		}
+		if quota, reason := looksLikeQuotaExhausted(combined); quota || (err != nil && looksLikeQuotaErr(err)) {
+			if !quota {
+				reason = err.Error()
+			}
+			if c.engine != nil {
+				c.engine.MarkAgentExhausted(adapter.ID(), reason)
+			}
+			if adapterIdx+1 < len(adapters) {
+				adapterIdx++
+				adapter = adapters[adapterIdx]
+				c.adapter = adapter // sticky for subsequent turns this process
+				trace = append(trace, fmt.Sprintf("ORCH FAILOVER → %s (%s)", adapter.ID(), reason))
+				i-- // retry same iteration with the next brain
+				continue
+			}
+			if i == 0 {
+				return ChatResult{}, fmt.Errorf("orch agent quota exhausted: %s", reason)
+			}
+			break
+		}
 		if err != nil || execRes.ExitCode != 0 {
 			if i == 0 {
 				return ChatResult{}, fmt.Errorf("orch agent execute failed: %v", err)
@@ -78,37 +102,42 @@ func (c *Conductor) agenticChat(ctx context.Context, userText string, refs []Pro
 	if result.Reply == "" {
 		result.Reply = "I investigated with tools but could not form a final answer. Try asking more specifically, or say \"what changed?\"."
 	}
-	for _, act := range last.Actions {
-		if act.Type != "run" || act.Objective == "" {
-			continue
-		}
-		ref, ok := findProject(refs, act.ProjectID)
-		if !ok && focusProjectID != "" {
-			ref, ok = findProject(refs, focusProjectID)
-		}
-		if !ok && len(refs) == 1 {
-			ref, ok = refs[0], true
-		}
-		if !ok {
-			result.Reply += fmt.Sprintf("\n\n(Could not resolve project for run.)")
-			continue
-		}
-		runID, err := c.engine.StartRun(ctx, PlanRequest{
-			Objective:     act.Objective,
-			ProjectID:     ref.ID,
-			WorkDir:       ref.Path,
-			AgentOverride: c.forceAgent,
-		})
-		if err != nil {
-			result.Reply += fmt.Sprintf("\n\nFailed to start run on %s: %v", ref.Name, err)
-			continue
-		}
-		act.RunID = runID
-		act.ProjectID = ref.ID
-		result.Actions = append(result.Actions, act)
-		result.Reply += fmt.Sprintf("\n\n▶ Started run `%s` on **%s**: %s", runID, ref.Name, act.Objective)
+	if len(last.Actions) > 0 {
+		result = c.applyGoalActions(ctx, result.Reply, last.Actions, refs, false)
 	}
 	return result, nil
+}
+
+// orchChatAdapters returns Detect-able conversational brains in failover order
+// (cursor → claude → codex), skipping agents marked exhausted.
+func (c *Conductor) orchChatAdapters(ctx context.Context) []agents.AgentAdapter {
+	order := OrchChatOrder()
+	seen := map[string]bool{}
+	var out []agents.AgentAdapter
+	add := func(ad agents.AgentAdapter) {
+		if ad == nil {
+			return
+		}
+		id := ad.ID()
+		if id == "" || seen[id] {
+			return
+		}
+		if c.engine != nil && c.engine.IsAgentExhausted(id) {
+			return
+		}
+		ok, err := ad.Detect(ctx)
+		if err != nil || !ok {
+			return
+		}
+		seen[id] = true
+		out = append(out, ad)
+	}
+	// Prefer the currently sticky adapter first when still healthy.
+	add(c.adapter)
+	for _, id := range order {
+		add(c.adapterForID(ctx, id))
+	}
+	return out
 }
 
 func (c *Conductor) orchAgentPrompt(userText string, refs []ProjectRef, focus, briefing string, trace []string, iter int) string {
@@ -137,9 +166,10 @@ func (c *Conductor) orchAgentPrompt(userText string, refs []ProjectRef, focus, b
 	if focus != "" {
 		focusNote = focus
 	}
-	return fmt.Sprintf(`You are the QtMesh Agents ORCHESTRATOR — a full agent representing the developer across projects.
-You coordinate workers (codex/claude/cursor), inspect git/worktrees/runs, and take actions via tools.
-You are NOT a passive chatbot. Investigate with tools, then answer clearly.
+	return fmt.Sprintf(`You are the QtMesh Agents ORCHESTRATOR — the leader of project leaders.
+Each registered project has a bench with a seated leader (claude/cursor/codex) and workers.
+You manage across benches: consult leaders for status, synthesize, and dispatch work through them.
+You are NOT a passive chatbot and NOT a single-project coder. Investigate with tools, then answer clearly.
 
 Adapter note: you may be Cursor, Claude, or another CLI — still only use the tool protocol below for QtMesh actions.
 
@@ -168,6 +198,7 @@ Respond with ONLY one JSON object (no markdown fence required):
 
 Available tools (name → args):
 - work_briefing: optional project_id
+- bench_status: optional project_id  (all open benches + latest run per project)
 - git_status: project_id
 - git_diff: project_id
 - git_log: project_id
@@ -178,13 +209,16 @@ Available tools (name → args):
 - binary_info: (none)
 - install_qma: project_id  (builds/installs qma binary; does NOT restart daemon)
 - ask_leader: project_id, question
-- start_run: project_id, objective  (prefer actions[] for runs; tool also works)
+- ask_leaders: question, optional project_ids (comma-separated; default = all matched / all registered)
+- bench_thread: optional project_id  (recent work-thread messages + goal status)
+- start_goal: project_id, objective  (durable bench goal loop; prefer actions[] type=run)
+- start_run: project_id, objective  (alias of start_goal)
 
 Rules:
+- Status/progress ("how is X going", "generated?"): call bench_thread / bench_status; answer in 1–3 short lines — never start_goal.
 - Prefer tools over guessing. Never invent commits, worktree paths, or run status.
-- Worker code lives in .qma-worktrees / feature branches until integrate succeeds.
-- When done investigating, set tools:[], fill answer, and optionally actions for new runs.
-- Keep answer readable: short verdict first, then bullets, then paths.
+- NEW work + no active goal → actions[] / start_goal. Active goal + correction ("do not generate X", "only the other 2") → do NOT start_goal; host amends the objective.
+- Keep answers clean: no full thread dumps, no run-id/iteration spam, no pasted briefing unless asked.
 - Do not merge to main. Do not push.
 `, formatProjectList(refs), focusNote, truncateObj(briefing, 8000), hist.String(), iter+1, tr.String(), userText)
 }
@@ -229,6 +263,8 @@ func (c *Conductor) execOrchTool(ctx context.Context, tc agentToolCall, refs []P
 	switch name {
 	case "work_briefing":
 		return c.gatherWorkBriefing(ctx, refs, pid)
+	case "bench_status":
+		return c.toolBenchStatus(ctx, refs, pid)
 	case "git_status":
 		ref, err := c.toolProject(refs, pid)
 		if err != nil {
@@ -329,7 +365,33 @@ func (c *Conductor) execOrchTool(ctx context.Context, tc agentToolCall, refs []P
 			return err.Error()
 		}
 		return reply
-	case "start_run":
+	case "ask_leaders":
+		q := strings.TrimSpace(args["question"])
+		if q == "" {
+			q = "Summarize project state and what to do next."
+		}
+		return c.toolAskLeaders(ctx, refs, focus, q, args["project_ids"])
+	case "bench_thread":
+		ref, err := c.toolProject(refs, pid)
+		if err != nil {
+			// No focus — try all projects briefly.
+			var b strings.Builder
+			for _, r := range refs {
+				if gp := c.FormatGoalProgress(ctx, r.ID); gp != "" {
+					b.WriteString(gp + "\n")
+				}
+			}
+			if b.Len() == 0 {
+				return err.Error()
+			}
+			return b.String()
+		}
+		gp := c.FormatGoalProgressVerbose(ctx, ref.ID)
+		if gp == "" {
+			return "no active/recent bench goal for " + ref.Name
+		}
+		return gp
+	case "start_goal", "start_run":
 		obj := strings.TrimSpace(args["objective"])
 		if obj == "" {
 			return "objective required"
@@ -338,16 +400,11 @@ func (c *Conductor) execOrchTool(ctx context.Context, tc agentToolCall, refs []P
 		if err != nil {
 			return err.Error()
 		}
-		if c.engine == nil {
-			return "no engine"
-		}
-		runID, err := c.engine.StartRun(ctx, PlanRequest{
-			Objective: obj, ProjectID: ref.ID, WorkDir: ref.Path, AgentOverride: c.forceAgent,
-		})
+		goalID, err := c.StartBenchGoal(ctx, ref.ID, obj, c.forceAgent)
 		if err != nil {
 			return err.Error()
 		}
-		return "started run " + runID
+		return "started bench goal " + goalID
 	default:
 		return "unknown tool: " + name
 	}
@@ -363,6 +420,109 @@ func (c *Conductor) toolProject(refs []ProjectRef, pid string) (ProjectRef, erro
 		return refs[0], nil
 	}
 	return ProjectRef{}, fmt.Errorf("project_id required (ambiguous projects)")
+}
+
+func (c *Conductor) toolBenchStatus(ctx context.Context, refs []ProjectRef, pid string) string {
+	if c.engine == nil {
+		return "no engine"
+	}
+	benches, err := c.engine.ListBenches(ctx)
+	if err != nil {
+		return err.Error()
+	}
+	var b strings.Builder
+	if len(benches) == 0 {
+		b.WriteString("No open benches. Starting a run opens a bench automatically.\n")
+	}
+	for _, bench := range benches {
+		if pid != "" && bench.ProjectID != pid {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("◆ %s [%s] leader=%s status=%s\n", bench.Name, bench.ProjectID, bench.LeaderAgentID, bench.Status))
+		if c.engine.store == nil {
+			continue
+		}
+		runs, _ := c.engine.store.ListRuns(ctx, 30)
+		var latest *struct {
+			id, status, obj string
+		}
+		for i := range runs {
+			r := runs[i]
+			if r.ProjectID != bench.ProjectID {
+				continue
+			}
+			latest = &struct{ id, status, obj string }{r.ID, r.Status, r.Objective}
+			break
+		}
+		if latest == nil {
+			b.WriteString("  latest run: none\n")
+			continue
+		}
+		b.WriteString(fmt.Sprintf("  latest run: %s [%s] %s\n", latest.id, latest.status, truncateObj(latest.obj, 72)))
+		tasks, _ := c.engine.store.ListTasksByRun(ctx, latest.id)
+		for _, t := range tasks {
+			b.WriteString(fmt.Sprintf("    - %s [%s] agent=%s\n", t.ID, t.Status, orDash(t.AssignedAgent)))
+		}
+	}
+	if pid != "" && b.Len() == 0 {
+		return "no bench for project_id=" + pid
+	}
+	if b.Len() == 0 {
+		return "no benches"
+	}
+	// Also list registered projects without a bench yet.
+	seated := map[string]bool{}
+	for _, bench := range benches {
+		seated[bench.ProjectID] = true
+	}
+	for _, ref := range refs {
+		if pid != "" && ref.ID != pid {
+			continue
+		}
+		if seated[ref.ID] {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("· %s [%s] (bench opens on first run)\n", ref.Name, ref.ID))
+	}
+	return b.String()
+}
+
+func (c *Conductor) toolAskLeaders(ctx context.Context, refs []ProjectRef, focus, question, projectIDsCSV string) string {
+	var targets []ProjectRef
+	csv := strings.TrimSpace(projectIDsCSV)
+	if csv != "" {
+		for _, part := range strings.Split(csv, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if ref, ok := findProject(refs, part); ok {
+				targets = append(targets, ref)
+			}
+		}
+	}
+	if len(targets) == 0 && focus != "" {
+		if ref, ok := findProject(refs, focus); ok {
+			targets = []ProjectRef{ref}
+		}
+	}
+	if len(targets) == 0 {
+		targets = refs
+	}
+	if len(targets) == 0 {
+		return "no projects"
+	}
+	var b strings.Builder
+	for _, ref := range targets {
+		reply, err := c.AskLeader(ctx, ref.ID, question, refs)
+		b.WriteString("### " + ref.Name + " (" + ref.ID + ")\n")
+		if err != nil {
+			b.WriteString(err.Error() + "\n\n")
+			continue
+		}
+		b.WriteString(reply + "\n\n")
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func gitCmd(dir string, args ...string) string {

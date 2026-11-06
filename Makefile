@@ -2,8 +2,12 @@ APP=qma
 MODULE=github.com/fernandotonon/QtMesh-Agents
 VERSION?=0.1.0-dev
 
-.PHONY: build test vet run install clean release-snapshot
+.PHONY: build web test vet run install clean release-snapshot
 
+web:
+	cd web && npm install && npm run build
+
+# Uses committed/embedded internal/web/dist. Run `make web` first after SPA changes.
 build:
 	go build -ldflags "-X $(MODULE)/pkg/version.Version=$(VERSION)" -o bin/$(APP) ./cmd/qma
 
@@ -17,6 +21,7 @@ run: build
 	./bin/$(APP)
 
 install:
+	@if [ -d web ] && command -v npm >/dev/null 2>&1; then $(MAKE) web; fi
 	go install -ldflags "-X $(MODULE)/pkg/version.Version=$(VERSION)" ./cmd/qma
 	@# Prefer a directory already on PATH (~/.local/bin or ~/bin) over GOPATH/bin.
 	@dest=""; \
@@ -34,9 +39,10 @@ install:
 	  echo "installed qma -> $$gobin/qma"; \
 	  echo "note: add $$gobin to PATH if 'qma' is not found"; \
 	fi
+	@echo "restart daemon to pick up the new binary: qma daemon stop && qma daemon start"
 
 clean:
-	rm -rf bin dist
+	rm -rf bin dist web/node_modules
 
 # Build release archives locally without publishing or pushing tags.
 release-snapshot:

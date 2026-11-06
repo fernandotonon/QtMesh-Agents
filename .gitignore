@@ -31,6 +31,11 @@ go.work.sum
 # Build artifacts
 bin/
 dist/
+web/node_modules/
+# Vite outDir is internal/web/dist (embedded); keep that committed.
+!internal/web/dist/
+!internal/web/dist/**
+web/dist/
 
 # Local runtime
 *.db

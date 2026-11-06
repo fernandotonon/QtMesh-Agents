@@ -60,6 +60,7 @@ func newRunCmd() *cobra.Command {
 	cmd.AddCommand(newRunStatusCmd())
 	cmd.AddCommand(newRunListCmd())
 	cmd.AddCommand(newRunCancelCmd())
+	cmd.AddCommand(newRunResumeCmd())
 	cmd.AddCommand(newRunDiffCmd())
 	return cmd
 }
@@ -156,6 +157,36 @@ func newRunCancelCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newRunResumeCmd() *cobra.Command {
+	var follow bool
+	var interval time.Duration
+	cmd := &cobra.Command{
+		Use:   "resume <run-id>",
+		Short: "Resume an incomplete run (unstick blocked verify/integrate)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, _, err := connectClient()
+			if err != nil {
+				return err
+			}
+			defer client.Close()
+			resp, err := client.RunResume(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "resumed: %s\n", resp.RunID)
+			if follow {
+				return followRun(cmd, client, resp.RunID, interval)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "watch with: qma run status %s --follow\n", resp.RunID)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "follow run progress until completion")
+	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "follow poll interval")
+	return cmd
 }
 
 func newRunDiffCmd() *cobra.Command {

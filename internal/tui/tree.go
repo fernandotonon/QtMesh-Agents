@@ -208,6 +208,32 @@ func (m Model) buildTree() []treeNode {
 				ProjectID: p.ID, BenchID: bench.ID, Agent: bench.LeaderAgentID,
 			})
 			if bexp {
+				if bench.GoalID != "" {
+					glabel := "goal:" + truncate(bench.GoalStatus, 16)
+					if bench.GoalIteration > 0 {
+						glabel = fmt.Sprintf("goal:%s i%d", truncate(bench.GoalStatus, 12), bench.GoalIteration)
+					}
+					nodes = append(nodes, treeNode{
+						Kind: nodeSection, ID: bkey + ":goal", Label: glabel,
+						Depth: 4, Status: bench.GoalStatus, ProjectID: p.ID, BenchID: bench.ID,
+					})
+					if obj := truncate(bench.GoalObjective, 28); obj != "" {
+						nodes = append(nodes, treeNode{
+							Kind: nodeSection, ID: bkey + ":goalobj", Label: obj,
+							Depth: 5, ProjectID: p.ID, BenchID: bench.ID,
+						})
+					}
+					for i, tm := range bench.ThreadPreview {
+						if i >= 3 {
+							break
+						}
+						nodes = append(nodes, treeNode{
+							Kind: nodeSection, ID: fmt.Sprintf("%s:th:%d", bkey, i),
+							Label: truncate(tm.Role+": "+tm.Content, 32),
+							Depth: 5, ProjectID: p.ID, BenchID: bench.ID,
+						})
+					}
+				}
 				for _, mem := range bench.Members {
 					role := "worker"
 					if mem == bench.LeaderAgentID {

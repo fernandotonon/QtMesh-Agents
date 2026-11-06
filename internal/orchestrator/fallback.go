@@ -21,16 +21,23 @@ func (e *Executor) SetFallbackAgents(ids []string) {
 func (e *Executor) pickAdapter(ctx context.Context, task *scheduler.Task) (agents.AgentAdapter, error) {
 	adapter, err := e.Registry.Require(task.AssignedAgent)
 	if err == nil {
-		ok, derr := adapter.Detect(ctx)
-		if derr == nil && ok {
-			return adapter, nil
+		if e.IsExhausted != nil && e.IsExhausted(task.AssignedAgent) {
+			e.log().Warn("assigned agent exhausted (quota); trying fallback", "agent", task.AssignedAgent)
+		} else {
+			ok, derr := adapter.Detect(ctx)
+			if derr == nil && ok {
+				return adapter, nil
+			}
+			e.log().Warn("assigned agent detect failed; trying fallback", "agent", task.AssignedAgent, "err", derr)
 		}
-		e.log().Warn("assigned agent detect failed; trying fallback", "agent", task.AssignedAgent, "err", derr)
 	} else {
 		e.log().Warn("assigned agent missing; trying fallback", "agent", task.AssignedAgent, "err", err)
 	}
 	for _, id := range e.fallbackList() {
 		if id == "" || id == task.AssignedAgent {
+			continue
+		}
+		if e.IsExhausted != nil && e.IsExhausted(id) {
 			continue
 		}
 		a, rerr := e.Registry.Require(id)
@@ -55,6 +62,9 @@ func (e *Executor) tryFallbackAgent(task *scheduler.Task) {
 	cur := task.AssignedAgent
 	for _, id := range e.fallbackList() {
 		if id == "" || id == cur {
+			continue
+		}
+		if e.IsExhausted != nil && e.IsExhausted(id) {
 			continue
 		}
 		if e.Registry == nil {

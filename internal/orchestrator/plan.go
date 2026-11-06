@@ -62,9 +62,7 @@ func (HeuristicPlanner) Plan(ctx context.Context, req PlanRequest) (scheduler.Pl
 		cat := "implementation"
 		lower := strings.ToLower(part)
 		switch {
-		case strings.Contains(lower, "test") || strings.Contains(lower, "verify"):
-			cat = "testing"
-		case strings.Contains(lower, "ui") || strings.Contains(lower, "frontend") || strings.Contains(lower, "tui"):
+		case regexp.MustCompile(`\b(ui|tui|frontend)\b|user interface`).MatchString(lower):
 			cat = "frontend"
 		case strings.Contains(lower, "review"):
 			cat = "review"
@@ -103,6 +101,41 @@ func (HeuristicPlanner) Plan(ctx context.Context, req PlanRequest) (scheduler.Pl
 		ProjectID:    req.ProjectID,
 	})
 
+	plan := scheduler.Plan{Tasks: tasks}
+	if err := plan.Validate(); err != nil {
+		return scheduler.Plan{}, err
+	}
+	return plan, nil
+}
+
+// UnitPlan builds a focused impl→verify plan for one bench-loop work unit
+// (skips lead/discover/integrate so the durable goal loop owns completion).
+func UnitPlan(req PlanRequest) (scheduler.Plan, error) {
+	obj := strings.TrimSpace(req.Objective)
+	if obj == "" {
+		return scheduler.Plan{}, fmt.Errorf("objective required")
+	}
+	tasks := []scheduler.Task{
+		{
+			ID:          "impl-1",
+			Description: obj,
+			Category:    "implementation",
+			Acceptance:  []string{"Scoped changes applied in isolation", "Diff is non-empty or explicit no-op justified"},
+			MaxRetries:  3,
+			Status:      scheduler.StatusPending,
+			ProjectID:   req.ProjectID,
+		},
+		{
+			ID:           "verify",
+			Description:  "Verify the unit of work: " + obj,
+			Category:     "testing",
+			Dependencies: []string{"impl-1"},
+			Acceptance:   []string{"Verification commands attempted", "Failures reported clearly"},
+			MaxRetries:   2,
+			Status:       scheduler.StatusPending,
+			ProjectID:    req.ProjectID,
+		},
+	}
 	plan := scheduler.Plan{Tasks: tasks}
 	if err := plan.Validate(); err != nil {
 		return scheduler.Plan{}, err

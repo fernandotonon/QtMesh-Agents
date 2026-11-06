@@ -2,11 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,13 +21,10 @@ import (
 // merge_approval attention. It does not ask an LLM whether to apply.
 func (e *Executor) runIntegrate(ctx context.Context, runID string, req PlanRequest, task *scheduler.Task) error {
 	reply := strings.ToLower(humanReplyFromResult(task.ResultJSON))
-	if isMergeApproveReply(reply) {
-		return e.applyMergeToMain(ctx, runID, req, task)
-	}
 	if isMergeRejectReply(reply) {
 		raw, _ := json.Marshal(map[string]any{
-			"agent":   "integrate",
-			"output":  "Human rejected apply-to-main; worktrees left in place.",
+			"agent":    "integrate",
+			"output":   "Human rejected apply-to-main; worktrees left in place.",
 			"rejected": true,
 		})
 		task.ResultJSON = string(raw)
@@ -35,6 +32,10 @@ func (e *Executor) runIntegrate(ctx context.Context, runID string, req PlanReque
 			_ = e.Emit(ctx, events.KindTaskCompleted, runID, task.ID, "integrate", "merge rejected; worktrees kept")
 		}
 		return nil
+	}
+
+	if isMergeApproveReply(reply) {
+		return e.applyMergeToMain(ctx, runID, req, task)
 	}
 
 	diff, paths, err := e.collectRunDiff(ctx, runID, req)
@@ -69,10 +70,11 @@ func (e *Executor) runIntegrate(ctx context.Context, runID string, req PlanReque
 		summary += "\nFindings:\n" + strings.Join(lines, "\n")
 	}
 	raw, _ := json.Marshal(map[string]any{
-		"agent":    "integrate",
-		"output":   summary,
-		"approved": rep.Approved,
-		"paths":    paths,
+		"agent":        "integrate",
+		"output":       summary,
+		"approved":     rep.Approved,
+		"paths":        paths,
+		"patch_digest": patchDigest(diff),
 	})
 	task.ResultJSON = string(raw)
 
@@ -102,7 +104,7 @@ func (e *Executor) collectRunDiff(ctx context.Context, runID string, req PlanReq
 	var paths []string
 	seen := map[string]bool{}
 	mgr := worktree.New(req.WorkDir, e.WorktreeBase)
-	for _, rec := range recs {
+	for _, rec := range artifactFrontier(recs) {
 		if isIntegrateTask(&scheduler.Task{ID: rec.ID, Category: rec.Category}) ||
 			rec.Category == "leadership" || rec.Category == "architecture" {
 			continue
@@ -110,15 +112,17 @@ func (e *Executor) collectRunDiff(ctx context.Context, runID string, req PlanReq
 		diff := ""
 		if rec.DiffPath != "" {
 			b, rerr := os.ReadFile(rec.DiffPath)
-			if rerr == nil {
-				diff = string(b)
+			if rerr != nil {
+				return "", nil, fmt.Errorf("read artifact %s: %w", rec.ID, rerr)
 			}
+			diff = string(b)
 		}
 		if diff == "" && rec.WorktreePath != "" {
 			d, derr := mgr.Diff(ctx, rec.WorktreePath)
-			if derr == nil {
-				diff = d
+			if derr != nil {
+				return "", nil, fmt.Errorf("capture %s: %w", rec.ID, derr)
 			}
+			diff = d
 		}
 		if strings.TrimSpace(diff) == "" {
 			continue
@@ -151,92 +155,46 @@ func (e *Executor) applyMergeToMain(ctx context.Context, runID string, req PlanR
 	if e.Store == nil {
 		return fmt.Errorf("store not configured")
 	}
-	recs, err := e.Store.ListTasksByRun(ctx, runID)
+	patch, paths, err := e.collectRunDiff(ctx, runID, req)
 	if err != nil {
 		return err
 	}
-	var applied []string
-	var failed []string
-	for _, rec := range recs {
-		if rec.WorktreePath == "" && rec.DiffPath == "" {
-			continue
-		}
-		if isIntegrateTask(&scheduler.Task{ID: rec.ID, Category: rec.Category}) {
-			continue
-		}
-		patch := ""
-		if rec.DiffPath != "" {
-			b, rerr := os.ReadFile(rec.DiffPath)
-			if rerr == nil {
-				patch = string(b)
-			}
-		}
-		if strings.TrimSpace(patch) == "" && rec.WorktreePath != "" {
-			d, derr := worktree.New(req.WorkDir, e.WorktreeBase).Diff(ctx, rec.WorktreePath)
-			if derr == nil {
-				patch = d
-			}
-		}
-		if strings.TrimSpace(patch) == "" {
-			continue
-		}
-		if aerr := applyUnifiedDiff(req.WorkDir, patch); aerr != nil {
-			if rec.WorktreePath != "" {
-				if cerr := copyWorktreeFiles(req.WorkDir, rec.WorktreePath, diffPaths(patch)); cerr == nil {
-					applied = append(applied, rec.ID)
-					continue
-				}
-			}
-			failed = append(failed, fmt.Sprintf("%s: %v", rec.ID, aerr))
-			continue
-		}
-		applied = append(applied, rec.ID)
+	var approved struct {
+		Digest string `json:"patch_digest"`
 	}
-	out := fmt.Sprintf("Applied patches from tasks: %s", strings.Join(applied, ", "))
-	if len(failed) > 0 {
-		out += "\nFailed: " + strings.Join(failed, "; ")
-		raw, _ := json.Marshal(map[string]any{"agent": "integrate", "output": out, "applied": applied, "failed": failed})
-		task.ResultJSON = string(raw)
-		return fmt.Errorf("apply to main incomplete: %s", strings.Join(failed, "; "))
+	if err := json.Unmarshal([]byte(task.ResultJSON), &approved); err != nil || approved.Digest == "" || approved.Digest != patchDigest(patch) {
+		return fmt.Errorf("integration artifacts changed or lack a review digest; prepare integration again before approval")
 	}
-	if len(applied) == 0 {
-		out = "No worktree diffs to apply (already clean or empty)."
+	// Recheck even after approval: approval never bypasses static review.
+	rep := review.ReviewDiff(task.ID, patch)
+	if !rep.Approved {
+		return fmt.Errorf("integration blocked: %s", rep.Summary)
 	}
-	raw, _ := json.Marshal(map[string]any{"agent": "integrate", "output": out, "applied": applied})
+	if err := applyUnifiedDiff(req.WorkDir, patch); err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(map[string]any{"agent": "integrate", "output": "Applied reviewed patch to project working tree", "paths": paths})
 	task.ResultJSON = string(raw)
-	if e.Emit != nil {
-		_ = e.Emit(ctx, events.KindTaskCompleted, runID, task.ID, "integrate", out)
-	}
 	return nil
 }
 
+// Git apply without --3way is atomic across the complete patch and leaves the
+// user's index alone. Conflicts fail without falling back to file overwrites.
 func applyUnifiedDiff(workDir, patch string) error {
-	tmp, err := os.CreateTemp("", "qma-patch-*.diff")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(patch); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	_ = tmp.Close()
-	cmd := exec.Command("git", "-C", workDir, "apply", "--3way", "--whitespace=nowarn", tmp.Name())
+	cmd := exec.Command("git", "-C", workDir, "apply", "--whitespace=nowarn", "-")
+	cmd.Stdin = strings.NewReader(patch)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Fallback: checkout changed files from the first worktree path encoded in patch headers is hard;
-		// try plain apply without 3way.
-		cmd2 := exec.Command("git", "-C", workDir, "apply", "--whitespace=nowarn", tmp.Name())
-		out2, err2 := cmd2.CombinedOutput()
-		if err2 != nil {
-			return fmt.Errorf("%w: %s; fallback: %v: %s", err, strings.TrimSpace(string(out)), err2, strings.TrimSpace(string(out2)))
-		}
+		return fmt.Errorf("integration conflict; project files preserved: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
 func isMergeApproveReply(reply string) bool {
 	low := strings.ToLower(reply)
+	if isMergeRejectReply(low) || strings.Contains(low, "do not approve") || strings.Contains(low, "don't approve") {
+		return false
+	}
 	needles := []string{
 		"approve apply",
 		"approve apply to main",
@@ -292,13 +250,13 @@ func (e *Executor) persistReview(ctx context.Context, runID string, task *schedu
 	}
 	findings, _ := json.Marshal(rep.Findings)
 	rec := storage.ReviewRecord{
-		ID:        fmt.Sprintf("rev-%s-%s-%d", runID, task.ID, time.Now().UnixNano()),
-		RunID:     runID,
-		TaskID:    task.ID,
-		ProjectID: e.ProjectID,
-		Summary:   rep.Summary,
-		Approved:  rep.Approved,
-		Findings:  string(findings),
+		ID:          fmt.Sprintf("rev-%s-%s-%d", runID, task.ID, time.Now().UnixNano()),
+		RunID:       runID,
+		TaskID:      task.ID,
+		ProjectID:   e.ProjectID,
+		Summary:     rep.Summary,
+		Approved:    rep.Approved,
+		Findings:    string(findings),
 		DiffSnippet: trimOut(diff),
 	}
 	return e.Store.UpsertReview(ctx, rec)
@@ -334,21 +292,4 @@ func orAgent(id, fallback string) string {
 	return id
 }
 
-// Copy changed files from a worktree into the main project path (used when git apply fails).
-func copyWorktreeFiles(mainDir, wtDir string, relPaths []string) error {
-	for _, rel := range relPaths {
-		src := filepath.Join(wtDir, rel)
-		dst := filepath.Join(mainDir, rel)
-		b, err := os.ReadFile(src)
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(dst, b, 0o644); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+func patchDigest(patch string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(patch))) }

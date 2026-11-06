@@ -133,6 +133,11 @@ FROM bench_members WHERE bench_id=?`, benchID)
 	return out, rows.Err()
 }
 
+func (s *Store) DeleteBenchMember(ctx context.Context, benchID, agentID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM bench_members WHERE bench_id=? AND agent_id=?`, benchID, agentID)
+	return err
+}
+
 func (s *Store) SetRunBenchID(ctx context.Context, runID, benchID string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE runs SET bench_id=?, updated_at=? WHERE id=?`,
 		nullStr(benchID), time.Now().UTC().Format(time.RFC3339), runID)

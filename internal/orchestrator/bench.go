@@ -25,11 +25,21 @@ func (e *Engine) EnsureBench(ctx context.Context, projectID, projectName string,
 		return storage.Bench{}, fmt.Errorf("project id required for bench")
 	}
 	if b, err := e.store.GetBenchByProject(ctx, projectID); err == nil {
+		leader := b.LeaderAgentID
+		// Sticky leader stays unless marked exhausted — then reseat along leadershipFallback.
+		if leader == "" || e.IsAgentExhausted(leader) || !e.leaderAvailable(ctx, leader) {
+			if next := e.preferLeaderAgent(ctx); next != "" && next != leader {
+				_ = e.ReseatLeader(ctx, b.ID, next, "previous leader unavailable or out of tokens")
+				b.LeaderAgentID = next
+				leader = next
+			}
+		}
 		_ = e.store.UpsertBench(ctx, storage.Bench{
 			ID: b.ID, ProjectID: b.ProjectID, Name: b.Name,
-			LeaderAgentID: b.LeaderAgentID, Status: BenchActive,
+			LeaderAgentID: leader, Status: BenchActive,
 			CreatedAt: b.CreatedAt, UpdatedAt: time.Now().UTC(),
 		})
+		b.LeaderAgentID = leader
 		b.Status = BenchActive
 		return b, nil
 	}
@@ -87,22 +97,112 @@ func (e *Engine) EnsureBench(ctx context.Context, projectID, projectName string,
 	return b, nil
 }
 
-func (e *Engine) preferLeaderAgent(ctx context.Context) string {
-	if e.registry == nil {
-		return "claude"
+// ReseatLeader updates the bench's leader agent and emits a reseat event.
+func (e *Engine) ReseatLeader(ctx context.Context, benchID, newLeader, reason string) error {
+	if benchID == "" || newLeader == "" {
+		return fmt.Errorf("bench id and new leader required")
 	}
-	for _, id := range []string{"claude", "codex", "cursor"} {
-		if a, ok := e.registry.Get(id); ok {
-			if det, _ := a.Detect(ctx); det {
-				entry, found := e.cfg.AgentByID(id)
-				if found && !entry.Enabled {
-					continue
-				}
-				return id
+	b, err := e.store.GetBench(ctx, benchID)
+	if err != nil {
+		return err
+	}
+	prev := b.LeaderAgentID
+	b.LeaderAgentID = newLeader
+	b.UpdatedAt = time.Now().UTC()
+	if err := e.store.UpsertBench(ctx, b); err != nil {
+		return err
+	}
+	// Demote any prior leader-role seats so the roster has exactly one leader.
+	if members, err := e.store.ListBenchMembers(ctx, b.ID); err == nil {
+		for _, m := range members {
+			if m.AgentID == newLeader {
+				continue
+			}
+			if m.Role == RoleLeader || m.AgentID == prev {
+				_ = e.store.UpsertBenchMember(ctx, storage.BenchMember{
+					BenchID: b.ID, AgentID: m.AgentID, Role: RoleWorker,
+				})
 			}
 		}
 	}
+	_ = e.store.UpsertBenchMember(ctx, storage.BenchMember{
+		BenchID: b.ID, AgentID: newLeader, Role: RoleLeader,
+	})
+	if prev == newLeader {
+		return nil
+	}
+	msg := fmt.Sprintf("leader %s → %s", prev, newLeader)
+	if reason != "" {
+		msg += ": " + reason
+	}
+	_ = e.emit(ctx, events.KindLeaderReseated, "", "", newLeader, msg)
+	e.log.Info("bench leader reseated", "bench", benchID, "from", prev, "to", newLeader, "reason", reason)
+	return nil
+}
+
+// ReseatLeaderForProject picks the next available leader when current is exhausted.
+func (e *Engine) ReseatLeaderForProject(ctx context.Context, projectID, reason string) (string, error) {
+	b, err := e.store.GetBenchByProject(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	next := e.preferLeaderAgent(ctx)
+	if next == "" {
+		return b.LeaderAgentID, nil
+	}
+	if next != b.LeaderAgentID {
+		if err := e.ReseatLeader(ctx, b.ID, next, reason); err != nil {
+			return "", err
+		}
+	}
+	return next, nil
+}
+
+func (e *Engine) preferLeaderAgent(ctx context.Context) string {
+	order := e.LeadershipOrder()
+	if e.registry == nil {
+		if len(order) > 0 {
+			return order[0]
+		}
+		return "claude"
+	}
+	for _, id := range order {
+		if e.IsAgentExhausted(id) {
+			continue
+		}
+		if e.leaderAvailable(ctx, id) {
+			return id
+		}
+	}
+	// Last resort: first Detect-able even if exhausted, so we still seat someone.
+	for _, id := range order {
+		if e.leaderAvailable(ctx, id) {
+			return id
+		}
+	}
+	if len(order) > 0 {
+		return order[0]
+	}
 	return "claude"
+}
+
+func (e *Engine) leaderAvailable(ctx context.Context, id string) bool {
+	if id == "" || e.registry == nil {
+		return false
+	}
+	a, ok := e.registry.Get(id)
+	if !ok {
+		return false
+	}
+	det, err := a.Detect(ctx)
+	if err != nil || !det {
+		return false
+	}
+	entry, found := e.cfg.AgentByID(id)
+	if found && !entry.Enabled {
+		return false
+	}
+	return true
 }
 
 // RaiseAttention records that the user must act, and marks the bench if known.
@@ -138,18 +238,33 @@ func (e *Engine) RaiseAttention(ctx context.Context, a storage.Attention) error 
 	return nil
 }
 
+// ResolveAttentionOpts controls post-resolve behavior (e.g. web resume with agent).
+type ResolveAttentionOpts struct {
+	// SkipResume prevents OnAttentionResolved (daemon goal auto-resume).
+	SkipResume bool
+}
+
 // ResolveAttention clears an attention mark.
 func (e *Engine) ResolveAttention(ctx context.Context, id string) error {
+	_, err := e.ResolveAttentionWith(ctx, id, ResolveAttentionOpts{})
+	return err
+}
+
+// ResolveAttentionWith clears an attention mark with optional resume control.
+func (e *Engine) ResolveAttentionWith(ctx context.Context, id string, opts ResolveAttentionOpts) (storage.Attention, error) {
 	a, err := e.store.GetAttention(ctx, id)
 	if err != nil {
-		return err
+		return storage.Attention{}, err
 	}
 	if err := e.store.ResolveAttention(ctx, id, "resolved"); err != nil {
-		return err
+		return storage.Attention{}, err
 	}
 	_ = e.healBenchAttention(ctx, a.ProjectID, a.BenchID)
 	_ = e.emit(ctx, events.KindAttentionResolved, a.RunID, a.TaskID, a.AgentID, "resolved "+id)
-	return nil
+	if e.OnAttentionResolved != nil && !opts.SkipResume {
+		e.OnAttentionResolved(ctx, a)
+	}
+	return a, nil
 }
 
 // healBenchAttention sets the bench back to active when no open attention remains
@@ -192,4 +307,37 @@ func (e *Engine) ListOpenAttention(ctx context.Context) ([]storage.Attention, er
 // ListBenches proxies storage.
 func (e *Engine) ListBenches(ctx context.Context) ([]storage.Bench, error) {
 	return e.store.ListBenches(ctx)
+}
+
+// AddBenchWorker seats a worker on an existing bench (idempotent).
+func (e *Engine) AddBenchWorker(ctx context.Context, benchID, agentID string) error {
+	if benchID == "" || agentID == "" {
+		return fmt.Errorf("bench id and agent id required")
+	}
+	if _, err := e.store.GetBench(ctx, benchID); err != nil {
+		return err
+	}
+	return e.store.UpsertBenchMember(ctx, storage.BenchMember{
+		BenchID: benchID, AgentID: agentID, Role: RoleWorker,
+	})
+}
+
+// RemoveBenchWorker removes a worker from a bench. Refuses to remove the seated leader.
+func (e *Engine) RemoveBenchWorker(ctx context.Context, benchID, agentID string) error {
+	if benchID == "" || agentID == "" {
+		return fmt.Errorf("bench id and agent id required")
+	}
+	b, err := e.store.GetBench(ctx, benchID)
+	if err != nil {
+		return err
+	}
+	if b.LeaderAgentID == agentID {
+		return fmt.Errorf("cannot remove the seated leader %q — reseat first", agentID)
+	}
+	return e.store.DeleteBenchMember(ctx, benchID, agentID)
+}
+
+// SetBenchLeader reseats the leader (manual override from UI/CLI).
+func (e *Engine) SetBenchLeader(ctx context.Context, benchID, agentID string) error {
+	return e.ReseatLeader(ctx, benchID, agentID, "manual seat from workspace")
 }

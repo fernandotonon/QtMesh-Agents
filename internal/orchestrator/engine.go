@@ -48,6 +48,15 @@ type Engine struct {
 	cancels  map[string]context.CancelFunc
 	running  map[string]bool
 	procs    *procTracker
+
+	// exhausted tracks vendor agents that hit quota/token limits this process.
+	// PreferLeader / AskLeader / orch chat skip them until ClearExhausted or TTL.
+	muExhaust sync.Mutex
+	exhausted map[string]time.Time
+
+	// OnAttentionResolved is invoked after an attention mark is resolved
+	// (used to resume paused bench goals).
+	OnAttentionResolved func(ctx context.Context, a storage.Attention)
 }
 
 // Dependencies for constructing an Engine.
@@ -69,15 +78,75 @@ func New(deps Deps) *Engine {
 		planner = HeuristicPlanner{}
 	}
 	return &Engine{
-		cfg:      deps.Config,
-		store:    deps.Store,
-		registry: deps.Registry,
-		planner:  planner,
-		log:      log,
-		cancels:  map[string]context.CancelFunc{},
-		running:  map[string]bool{},
-		procs:    newProcTracker(),
+		cfg:       deps.Config,
+		store:     deps.Store,
+		registry:  deps.Registry,
+		planner:   planner,
+		log:       log,
+		cancels:   map[string]context.CancelFunc{},
+		running:   map[string]bool{},
+		procs:     newProcTracker(),
+		exhausted: map[string]time.Time{},
 	}
+}
+
+const agentExhaustTTL = 6 * time.Hour
+
+// MarkAgentExhausted records that an agent hit quota/token limits.
+func (e *Engine) MarkAgentExhausted(agentID, reason string) {
+	if e == nil || agentID == "" {
+		return
+	}
+	e.muExhaust.Lock()
+	defer e.muExhaust.Unlock()
+	if e.exhausted == nil {
+		e.exhausted = map[string]time.Time{}
+	}
+	e.exhausted[agentID] = time.Now().UTC().Add(agentExhaustTTL)
+	e.log.Warn("agent marked exhausted (quota/tokens)", "agent", agentID, "reason", reason, "until", e.exhausted[agentID])
+}
+
+// ClearAgentExhausted clears a prior quota mark (e.g. after the user tops up).
+func (e *Engine) ClearAgentExhausted(agentID string) {
+	if e == nil || agentID == "" {
+		return
+	}
+	e.muExhaust.Lock()
+	defer e.muExhaust.Unlock()
+	delete(e.exhausted, agentID)
+}
+
+// IsAgentExhausted reports whether the agent is still within a quota cooldown.
+func (e *Engine) IsAgentExhausted(agentID string) bool {
+	if e == nil || agentID == "" {
+		return false
+	}
+	e.muExhaust.Lock()
+	defer e.muExhaust.Unlock()
+	until, ok := e.exhausted[agentID]
+	if !ok {
+		return false
+	}
+	if time.Now().UTC().After(until) {
+		delete(e.exhausted, agentID)
+		return false
+	}
+	return true
+}
+
+// LeadershipOrder returns the configured leadership failover chain
+// (default claude → cursor → codex).
+func (e *Engine) LeadershipOrder() []string {
+	if e != nil && len(e.cfg.Routing.LeadershipFallback) > 0 {
+		return append([]string(nil), e.cfg.Routing.LeadershipFallback...)
+	}
+	return []string{"claude", "cursor", "codex"}
+}
+
+// OrchChatOrder returns the conversational orchestrator failover chain
+// (cursor → claude → codex), skipping agents already marked exhausted.
+func OrchChatOrder() []string {
+	return []string{"cursor", "claude", "codex"}
 }
 
 // CreatePlan builds a validated plan (without executing).
@@ -112,6 +181,10 @@ func (e *Engine) assignAgents(ctx context.Context, plan scheduler.Plan) schedule
 		for id := range available {
 			entry, found := e.cfg.AgentByID(id)
 			if !found || !entry.Enabled {
+				available[id] = false
+			}
+			// Skip vendors already known to be out of tokens this process.
+			if available[id] && e.IsAgentExhausted(id) {
 				available[id] = false
 			}
 		}
@@ -237,6 +310,102 @@ func (e *Engine) StartRun(ctx context.Context, req PlanRequest) (string, error) 
 
 	go e.executeRun(runCtx, runID, req, plan)
 	return runID, nil
+}
+
+// StartUnitRun plans a focused impl→verify unit and executes asynchronously.
+// Used by the bench goal loop so one DAG failure does not end the goal.
+func (e *Engine) StartUnitRun(ctx context.Context, req PlanRequest) (string, error) {
+	if req.Objective == "" {
+		return "", fmt.Errorf("objective required")
+	}
+	if req.WorkDir == "" {
+		return "", fmt.Errorf("work directory required")
+	}
+
+	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+
+	var benchID string
+	if req.ProjectID != "" {
+		workers := []string{}
+		if req.AgentOverride != "" {
+			workers = append(workers, req.AgentOverride)
+		}
+		if b, berr := e.EnsureBench(ctx, req.ProjectID, req.ProjectID, workers); berr == nil {
+			benchID = b.ID
+		}
+	}
+
+	run := storage.Run{
+		ID: runID, ProjectID: req.ProjectID, BenchID: benchID,
+		Objective: req.Objective, Status: RunPlanning, Planner: "unit",
+		WorkDir: req.WorkDir, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := e.store.UpsertRun(ctx, run); err != nil {
+		return "", err
+	}
+
+	plan, err := UnitPlan(req)
+	if err != nil {
+		run.Status = RunFailed
+		run.Error = err.Error()
+		ended := time.Now().UTC()
+		run.EndedAt = &ended
+		_ = e.store.UpsertRun(ctx, run)
+		return runID, err
+	}
+	// Same seating as CreatePlan — UnitPlan itself leaves AssignedAgent empty.
+	if req.AgentOverride != "" {
+		plan = e.applyOverride(plan, req.AgentOverride)
+	} else {
+		plan = e.assignAgents(ctx, plan)
+	}
+	plan = uniquifyTaskIDs(runID, plan)
+	for _, t := range plan.Tasks {
+		if err := e.store.UpsertTask(ctx, taskToRecord(runID, t)); err != nil {
+			return runID, err
+		}
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.cancels[runID] = cancel
+	e.running[runID] = true
+	e.mu.Unlock()
+
+	run.Status = RunRunning
+	run.UpdatedAt = time.Now().UTC()
+	if err := e.store.UpsertRun(ctx, run); err != nil {
+		cancel()
+		e.mu.Lock()
+		delete(e.cancels, runID)
+		delete(e.running, runID)
+		e.mu.Unlock()
+		return runID, err
+	}
+	go e.executeRun(runCtx, runID, req, plan)
+	return runID, nil
+}
+
+// WaitRun blocks until the run reaches a terminal status (or ctx cancels).
+func (e *Engine) WaitRun(ctx context.Context, runID string) (storage.Run, error) {
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		r, err := e.store.GetRun(ctx, runID)
+		if err != nil {
+			return storage.Run{}, err
+		}
+		switch r.Status {
+		case RunSucceeded, RunFailed, RunCancelled, RunNeedsAttention:
+			return r, nil
+		}
+		select {
+		case <-ctx.Done():
+			return r, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // CancelRun cancels a running orchestration. Always updates storage and reaps
@@ -374,8 +543,8 @@ func (e *Engine) resumeAfterReply(ctx context.Context, runID, taskID, reply stri
 			rec.Error = ""
 			rec.UpdatedAt = now
 			_ = e.store.UpsertTask(ctx, rec)
-		} else if st == scheduler.StatusAwaitingInput {
-			// Other paused tasks stay pending so the DAG can continue after this reply.
+		} else if st == scheduler.StatusAwaitingInput || st == scheduler.StatusBlocked {
+			// Unstick paused/orphaned downstream tasks so the DAG can continue.
 			st = scheduler.StatusPending
 			rec.Status = string(st)
 			rec.Error = "resumed after human reply"
@@ -407,6 +576,148 @@ func (e *Engine) resumeAfterReply(ctx context.Context, runID, taskID, reply stri
 	e.log.Info("resuming run after human reply", "run", runID, "task", taskID)
 	go e.executeRun(runCtx, runID, req, scheduler.Plan{Tasks: tasks})
 	return nil
+}
+
+// ResumeIncompleteRun unsticks a failed/needs_attention run whose downstream
+// tasks were orphaned as "blocked" (e.g. after a mid-run ⚠ pause) and continues
+// the DAG from remaining pending work. Succeeded tasks are left alone.
+func (e *Engine) ResumeIncompleteRun(ctx context.Context, runID string) error {
+	if runID == "" {
+		return fmt.Errorf("run id required")
+	}
+	r, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	switch r.Status {
+	case RunFailed, RunNeedsAttention, RunCancelled:
+	case RunRunning, RunPlanning:
+		e.mu.Lock()
+		already := e.running[runID]
+		e.mu.Unlock()
+		if already {
+			return fmt.Errorf("run %s is still executing", runID)
+		}
+	default:
+		return fmt.Errorf("run %s is %s — nothing to resume", runID, r.Status)
+	}
+	recs, err := e.store.ListTasksByRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	tasks := make([]scheduler.Task, 0, len(recs))
+	unstuck := 0
+	for _, rec := range recs {
+		st := scheduler.TaskStatus(rec.Status)
+		switch st {
+		case scheduler.StatusBlocked, scheduler.StatusAwaitingInput, scheduler.StatusCancelled:
+			st = scheduler.StatusPending
+			rec.Status = string(st)
+			rec.Error = "resumed incomplete run"
+			rec.UpdatedAt = now
+			_ = e.store.UpsertTask(ctx, rec)
+			unstuck++
+		case scheduler.StatusFailed:
+			// Retry failed verify/integrate; leave failed impl alone if it has a
+			// worktree commit — re-running expensive generation is rarely wanted.
+			id := shortID(rec.ID)
+			if id == "verify" || id == "integrate" || strings.HasSuffix(rec.ID, "-verify") || strings.HasSuffix(rec.ID, "-integrate") {
+				st = scheduler.StatusPending
+				rec.Status = string(st)
+				rec.Error = "retry after incomplete run"
+				rec.UpdatedAt = now
+				_ = e.store.UpsertTask(ctx, rec)
+				unstuck++
+			}
+		}
+		tasks = append(tasks, scheduler.Task{
+			ID: rec.ID, Description: rec.Description, Category: rec.Category,
+			Dependencies: rec.Dependencies, AssignedAgent: rec.AssignedAgent,
+			Status: st, Acceptance: rec.Acceptance, MaxRetries: rec.MaxRetries,
+			RetryCount: rec.RetryCount, ProjectID: rec.ProjectID, RunID: r.ID,
+			WorktreePath: rec.WorktreePath, Branch: rec.Branch,
+			Error: rec.Error, DiffPath: rec.DiffPath, ResultJSON: rec.ResultJSON,
+		})
+	}
+	if unstuck == 0 && scheduler.Succeeded(tasks) {
+		return fmt.Errorf("run %s already complete", runID)
+	}
+	if scheduler.AllTerminal(tasks) && !scheduler.NeedsAttention(tasks) {
+		// Nothing runnable even after unstick.
+		pending := false
+		for _, t := range tasks {
+			if t.Status == scheduler.StatusPending || t.Status == scheduler.StatusReady {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return fmt.Errorf("run %s has no remaining work to resume", runID)
+		}
+	}
+
+	r.Status = RunRunning
+	r.Error = ""
+	r.UpdatedAt = now
+	r.EndedAt = nil
+	_ = e.store.UpsertRun(ctx, r)
+
+	req := PlanRequest{Objective: r.Objective, ProjectID: r.ProjectID, WorkDir: r.WorkDir}
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.cancels[runID] = cancel
+	e.running[runID] = true
+	e.mu.Unlock()
+	e.log.Info("resuming incomplete run", "run", runID, "unstuck", unstuck)
+	go e.executeRun(runCtx, runID, req, scheduler.Plan{Tasks: tasks})
+	return nil
+}
+
+// LatestIncompleteRunID returns the newest failed/needs_attention run for a project
+// that still has blocked/pending/awaiting work after some successes.
+func (e *Engine) LatestIncompleteRunID(ctx context.Context, projectID string) (string, error) {
+	if projectID == "" {
+		return "", fmt.Errorf("project id required")
+	}
+	list, err := e.store.ListRuns(ctx, 40)
+	if err != nil {
+		return "", err
+	}
+	for _, r := range list {
+		if r.ProjectID != projectID {
+			continue
+		}
+		switch r.Status {
+		case RunFailed, RunNeedsAttention, RunCancelled:
+		default:
+			continue
+		}
+		recs, err := e.store.ListTasksByRun(ctx, r.ID)
+		if err != nil {
+			continue
+		}
+		hasSuccess, hasRemaining := false, false
+		for _, t := range recs {
+			switch t.Status {
+			case string(scheduler.StatusSucceeded):
+				hasSuccess = true
+			case string(scheduler.StatusBlocked), string(scheduler.StatusPending),
+				string(scheduler.StatusReady), string(scheduler.StatusAwaitingInput),
+				string(scheduler.StatusFailed):
+				id := shortID(t.ID)
+				if t.Status == string(scheduler.StatusFailed) && id != "verify" && id != "integrate" &&
+					!strings.HasSuffix(t.ID, "-verify") && !strings.HasSuffix(t.ID, "-integrate") {
+					continue
+				}
+				hasRemaining = true
+			}
+		}
+		if hasSuccess && hasRemaining {
+			return r.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no incomplete run for %s", projectID)
 }
 
 // ResumeOrphanedRuns re-attaches executors for runs left "running" after a daemon restart.
@@ -602,9 +913,16 @@ func (e *Engine) executeRun(ctx context.Context, runID string, req PlanRequest, 
 		MaxRetries:      e.cfg.Execution.MaxRetries,
 		RequireApproval: e.cfg.Orchestrator.RequireApprovalForMerge,
 		RaiseAttention:  e.RaiseAttention,
-		ProjectID:       req.ProjectID,
-		BenchID:         benchID,
-		Emit:            e.emit,
+		OnQuotaExhausted: func(agentID, reason string) {
+			e.MarkAgentExhausted(agentID, reason)
+			if req.ProjectID != "" {
+				_, _ = e.ReseatLeaderForProject(context.Background(), req.ProjectID, reason)
+			}
+		},
+		IsExhausted: e.IsAgentExhausted,
+		ProjectID:   req.ProjectID,
+		BenchID:     benchID,
+		Emit:        e.emit,
 	}
 	if req.AgentOverride != "" {
 		// Honor forced agent — do not silently hop to another vendor mid-run.

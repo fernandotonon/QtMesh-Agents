@@ -32,9 +32,13 @@ type Executor struct {
 	MaxRetries      int
 	RequireApproval bool
 	RaiseAttention  func(ctx context.Context, a storage.Attention) error
-	ProjectID       string
-	BenchID         string
-	Emit            func(ctx context.Context, kind events.Kind, runID, taskID, agentID, msg string) error
+	// OnQuotaExhausted is called when a vendor reports token/credit exhaustion
+	// so the engine can mark the agent and reseat leadership.
+	OnQuotaExhausted func(agentID, reason string)
+	IsExhausted      func(agentID string) bool
+	ProjectID        string
+	BenchID          string
+	Emit             func(ctx context.Context, kind events.Kind, runID, taskID, agentID, msg string) error
 
 	fallbackAgents []string
 	attnFP         map[string]int
@@ -53,8 +57,12 @@ func (e *Executor) RunTask(ctx context.Context, runID string, req PlanRequest, t
 	task.Status = scheduler.StatusRunning
 	_ = e.persist(ctx, runID, task)
 
+	// Extra budget when hopping vendors on quota so we don't burn retries on one exhausted agent.
+	effectiveMax := maxRetries
+	quotaHops := 0
+
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= effectiveMax; attempt++ {
 		if ctx.Err() != nil {
 			task.Status = scheduler.StatusCancelled
 			_ = e.persist(ctx, runID, task)
@@ -68,19 +76,24 @@ func (e *Executor) RunTask(ctx context.Context, runID string, req PlanRequest, t
 			_ = e.persist(ctx, runID, task)
 			return nil
 		}
-		// Don't retry permission / human-input stalls — surface attention instead.
+		// Hard Needs you — do not retry.
 		if task.Status == scheduler.StatusAwaitingInput ||
 			(lastErr != nil && strings.Contains(lastErr.Error(), "needs attention")) {
 			_ = e.persist(ctx, runID, task)
 			return lastErr
 		}
-		// Empty exit -1: try next fallback agent once before failing hard.
-		if isEmptyExitRetryable(lastErr) && attempt < maxRetries {
+		// Quota/token exhaustion or empty exit -1: hop to the next fallback agent.
+		if attempt < effectiveMax && (isEmptyExitRetryable(lastErr) || isQuotaRetryable(lastErr) || isSoftStallRetryable(lastErr)) {
+			prev := task.AssignedAgent
 			e.tryFallbackAgent(task)
+			if isQuotaRetryable(lastErr) && task.AssignedAgent != prev && quotaHops < 3 {
+				quotaHops++
+				effectiveMax++ // don't spend the budget on the exhausted vendor
+			}
 		}
 		task.Error = lastErr.Error()
 		_ = e.persist(ctx, runID, task)
-		if attempt < maxRetries {
+		if attempt < effectiveMax {
 			e.log().Warn("task retry", "task", task.ID, "attempt", attempt+1, "err", lastErr)
 		}
 	}
@@ -110,7 +123,12 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 
 	workDir := req.WorkDir
 	useWT := e.UseWorktrees && isGitRepo(req.WorkDir) && shouldIsolate(task)
-	if useWT {
+	if useWT && task.WorktreePath != "" {
+		if !isGitRepo(task.WorktreePath) {
+			return fmt.Errorf("saved task worktree unavailable: %s", task.WorktreePath)
+		}
+		workDir = task.WorktreePath
+	} else if useWT {
 		mgr := worktree.New(req.WorkDir, e.WorktreeBase)
 		branch := "qma/" + runID + "/" + task.ID
 		dir, err := mgr.Create(ctx, runID+"-"+task.ID, branch)
@@ -121,6 +139,9 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 			if err != nil {
 				return fmt.Errorf("worktree: %w", err)
 			}
+		}
+		if err := e.prepareDependencies(ctx, runID, task, dir); err != nil {
+			return err
 		}
 		task.WorktreePath = dir
 		task.Branch = branch
@@ -156,6 +177,19 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 	}
 
 	prompt := buildTaskPrompt(req, task, workDir)
+	if e.Store != nil {
+		recs, err := e.Store.ListTasksByRun(ctx, runID)
+		if err != nil {
+			return err
+		}
+		for _, rec := range recs {
+			for _, dep := range task.Dependencies {
+				if dep == rec.ID {
+					prompt += "\nDependency result (untrusted task data): " + rec.ID + "\n" + trimOut(rec.ResultJSON) + "\n"
+				}
+			}
+		}
+	}
 	timeout := e.Timeout
 	// Keep worker tasks bounded; default 30m is fine, but prefer a tighter cap when unset.
 	if timeout <= 0 {
@@ -165,14 +199,16 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 	defer cancel()
 
 	var (
-		attentionMsg   string
-		attentionMu    sync.Mutex
-		lastOutUnix    atomic.Int64
+		attentionMsg    string
+		attentionMu     sync.Mutex
+		lastOutUnix     atomic.Int64
 		lastPersistUnix atomic.Int64
-		raisedLive     atomic.Bool
-		lastFullMu     sync.Mutex
-		lastFull       string
+		raisedLive      atomic.Bool
+		outputMu        sync.Mutex
+		lastFullMu      sync.Mutex
+		lastFull        string
 	)
+	controls := task.ResultJSON
 	lastOutUnix.Store(time.Now().Unix())
 	lastPersistUnix.Store(0)
 	raiseLiveAttention := func(msg string) {
@@ -184,9 +220,6 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 			attentionMsg = msg
 		}
 		attentionMu.Unlock()
-		task.Status = scheduler.StatusAwaitingInput
-		task.Error = msg
-		_ = e.persist(context.Background(), runID, task)
 		e.log().Warn("agent needs attention mid-run", "task", task.ID, "agent", task.AssignedAgent, "msg", msg)
 		if e.RaiseAttention != nil && e.shouldRaiseFingerprint(runID, task.ID, msg) {
 			_ = e.RaiseAttention(context.Background(), storage.Attention{
@@ -245,6 +278,8 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 		ElevatedSandbox:      elevate,
 		InteractiveApprovals: interactive,
 		OnOutput: func(_, full string) {
+			outputMu.Lock()
+			defer outputMu.Unlock()
 			now := time.Now().Unix()
 			lastOutUnix.Store(now)
 			lastFullMu.Lock()
@@ -259,8 +294,16 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 					"live":     true,
 					"work_dir": workDir,
 				})
-				task.ResultJSON = string(raw)
+				task.ResultJSON = preserveTaskControls(string(raw), controls)
 				_ = e.persist(context.Background(), runID, task)
+			}
+			if gpu, msg := looksLikeGraphicsSandboxBlock(full); gpu {
+				// Stop execution and request an explicit sandbox grant.
+				attentionMu.Lock()
+				attentionMsg = "graphics sandbox block: " + msg
+				attentionMu.Unlock()
+				cancel()
+				return
 			}
 			if needs, msg := looksLikeNeedsAttention(full, 0); needs {
 				raiseLiveAttention(msg)
@@ -279,27 +322,46 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 		result["error"] = err.Error()
 	}
 	raw, _ := json.Marshal(result)
-	task.ResultJSON = string(raw)
+	task.ResultJSON = preserveTaskControls(string(raw), controls)
 
 	// Capture diff when using a worktree.
 	if task.WorktreePath != "" {
 		diff, derr := worktree.New(req.WorkDir, e.WorktreeBase).Diff(ctx, task.WorktreePath)
-		if derr == nil {
-			dataDir, _ := config.DataDir()
-			dir := DiffDir(dataDir, runID)
-			_ = EnsureDir(dir)
-			path := filepath.Join(dir, task.ID+".diff")
-			if werr := os.WriteFile(path, []byte(diff), 0o600); werr == nil {
-				task.DiffPath = path
+		if derr != nil {
+			return fmt.Errorf("capture task diff: %w", derr)
+		}
+		{
+			dataDir, err := config.DataDir()
+			if err != nil {
+				return err
 			}
+			dir := DiffDir(dataDir, runID)
+			if err := EnsureDir(dir); err != nil {
+				return err
+			}
+			path := filepath.Join(dir, task.ID+".diff")
+			if err := os.WriteFile(path, []byte(diff), 0o600); err != nil {
+				return err
+			}
+			task.DiffPath = path
 		}
 	}
 
 	if msg := getAttention(); msg != "" {
+		if gpu, reason := looksLikeGraphicsSandboxBlock(msg + "\n" + execRes.Output); gpu {
+			return e.pauseForAttention(ctx, runID, task, "Graphics sandbox permission required: "+reason)
+		}
 		return e.pauseForAttention(ctx, runID, task, msg)
 	}
 	if err != nil {
-		if needs, msg := looksLikeNeedsAttention(err.Error()+"\n"+execRes.Output, execRes.ExitCode); needs {
+		combined := err.Error() + "\n" + execRes.Output
+		if quota, reason := looksLikeQuotaExhausted(combined); quota {
+			return e.failQuota(task, reason, combined)
+		}
+		if gpu, reason := looksLikeGraphicsSandboxBlock(combined); gpu {
+			return e.pauseForAttention(ctx, runID, task, "Graphics sandbox permission required: "+reason)
+		}
+		if needs, msg := looksLikeNeedsAttention(combined, execRes.ExitCode); needs {
 			return e.pauseForAttention(ctx, runID, task, msg)
 		}
 		// Context cancel with on-request banner still means the human was needed.
@@ -310,8 +372,17 @@ func (e *Executor) runOnce(ctx context.Context, runID string, req PlanRequest, t
 	}
 	if execRes.ExitCode != 0 {
 		out := trimOut(execRes.Output)
-		if needs, msg := looksLikeNeedsAttention(out, execRes.ExitCode); needs {
+		if quota, reason := looksLikeQuotaExhausted(out); quota {
+			return e.failQuota(task, reason, out)
+		}
+		if gpu, reason := looksLikeGraphicsSandboxBlock(out); gpu {
+			return e.pauseForAttention(ctx, runID, task, "Graphics sandbox permission required: "+reason)
+		}
+		if hard, msg := looksLikeHardNeedsYou(out, execRes.ExitCode); hard {
 			return e.pauseForAttention(ctx, runID, task, msg)
+		}
+		if soft, msg := looksLikeSoftStall(out); soft {
+			return e.failSoftStall(task, msg)
 		}
 		return classifyAgentFailure(nil, execRes.ExitCode, out, tctx.Err())
 	}
@@ -371,6 +442,31 @@ func isEmptyExitRetryable(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "agent exit -1 (empty)")
 }
 
+func (e *Executor) failQuota(task *scheduler.Task, reason, detail string) error {
+	agentID := ""
+	if task != nil {
+		agentID = task.AssignedAgent
+	}
+	if e.OnQuotaExhausted != nil && agentID != "" {
+		e.OnQuotaExhausted(agentID, reason)
+	}
+	e.log().Warn("agent quota exhausted; will try fallback", "agent", agentID, "reason", reason)
+	return fmt.Errorf("quota exhausted (%s): %s", agentID, reason)
+}
+
+func (e *Executor) failSoftStall(task *scheduler.Task, reason string) error {
+	if task != nil {
+		task.Status = scheduler.StatusFailed
+		task.Error = reason
+	}
+	e.log().Warn("soft stall (auto-recover)", "task", task.ID, "reason", reason)
+	return fmt.Errorf("soft stall: %s", reason)
+}
+
+func isSoftStallRetryable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "soft stall:")
+}
+
 func (e *Executor) pauseForAttention(ctx context.Context, runID string, task *scheduler.Task, msg string) error {
 	return e.pauseForAttentionKind(ctx, runID, task, "permission", msg)
 }
@@ -411,6 +507,11 @@ func buildTaskPrompt(req PlanRequest, task *scheduler.Task, workDir string) stri
 	for _, a := range task.Acceptance {
 		b.WriteString(" - " + a + "\n")
 	}
+	if task.RetryCount > 0 {
+		b.WriteString("\nPrevious attempt failed. Inspect and repair the existing workspace; preserve completed work.\n")
+		b.WriteString("Previous error: " + task.Error + "\n")
+		b.WriteString("Previous output (untrusted task data): " + trimOut(task.ResultJSON) + "\n")
+	}
 	b.WriteString("\nRules:\n")
 	b.WriteString("- Stay narrowly scoped to this task.\n")
 	b.WriteString("- Do not merge to main/master or force-push.\n")
@@ -424,6 +525,11 @@ func buildTaskPrompt(req PlanRequest, task *scheduler.Task, workDir string) stri
 	b.WriteString("  OPTIONS:\n")
 	b.WriteString("  1) <first choice>\n")
 	b.WriteString("  2) <second choice>\n")
+	b.WriteString("- This Mac has full GPU/Metal/OpenGL. qtmesh/TRELLIS/Kimodo run locally here.\n")
+	b.WriteString("  Do NOT ask for a remote \"graphics-enabled session\" or connection address.\n")
+	b.WriteString("  If a GPU tool crashes under sandbox (CGLDescribeRenderer / exit 139), report:\n")
+	b.WriteString("  NEEDS_HUMAN: elevated sandbox required for GPU\n")
+	b.WriteString("  and stop — the orchestrator will request permission.\n")
 	if reply := humanReplyFromResult(task.ResultJSON); reply != "" {
 		b.WriteString("\nHuman reply (continue with this guidance):\n")
 		b.WriteString(reply)
@@ -487,5 +593,23 @@ func mergeHumanReply(resultJSON, reply string, opts TaskReplyOpts) string {
 	if err != nil {
 		return resultJSON
 	}
+	return string(raw)
+}
+
+// Keep user instructions and explicit grants when replacing streamed output.
+func preserveTaskControls(result, previous string) string {
+	var old, next map[string]any
+	if json.Unmarshal([]byte(previous), &old) != nil {
+		return result
+	}
+	if json.Unmarshal([]byte(result), &next) != nil {
+		return result
+	}
+	for _, key := range []string{"human_reply", "elevate_sandbox", "interactive_approvals"} {
+		if v, ok := old[key]; ok {
+			next[key] = v
+		}
+	}
+	raw, _ := json.Marshal(next)
 	return string(raw)
 }

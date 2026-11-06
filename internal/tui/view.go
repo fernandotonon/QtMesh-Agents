@@ -34,23 +34,33 @@ func (m Model) View() string {
 	)
 
 	sideW := 30
-	if m.width < 70 {
+	if m.chatWide {
+		sideW = 0
+	} else if m.width < 70 {
 		sideW = max(18, m.width/2)
 	}
-	mainW := m.width - sideW - 1
+	mainW := m.width - sideW
+	if sideW > 0 {
+		mainW--
+	}
 	if mainW < 16 {
 		mainW = 16
 	}
-	// header(1) + hint(1) + prompt(1) + optional worker banner / err
+	// header(1) + hint(1) + prompt(1) + optional worker banner / err / flash
 	footerLines := m.footerLineCount()
 	bodyH := m.height - 1 - footerLines
 	if bodyH < 4 {
 		bodyH = 4
 	}
 
-	side := m.renderSidebar(sideW, bodyH)
-	main := m.renderMain(mainW, bodyH)
-	body := lipgloss.JoinHorizontal(lipgloss.Top, side, main)
+	var body string
+	if m.chatWide {
+		body = m.renderMain(mainW, bodyH)
+	} else {
+		side := m.renderSidebar(sideW, bodyH)
+		main := m.renderMain(mainW, bodyH)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, side, main)
+	}
 
 	footer := m.renderFooter()
 
@@ -65,6 +75,9 @@ func (m Model) footerLineCount() int {
 		n++ // worker banner
 	}
 	if m.errMsg != "" {
+		n++
+	}
+	if m.statusFlash != "" {
 		n++
 	}
 	return n
@@ -89,15 +102,21 @@ func (m Model) renderFooter() string {
 		b.WriteByte('\n')
 		b.WriteString(okStyle.Render("LEADER › ") + m.input.View())
 	} else {
-		hint := dimStyle.Render("Tab focus · j/k tree · enter open · o orch · select leader to consult")
-		if m.focus == focusTree {
-			hint = okStyle.Render("TREE") + " " + dimStyle.Render("j/k · enter · →/← · o orch")
+		hint := dimStyle.Render("Tab · f chat-wide (copy) · y yank chat · Y last reply · j/k tree · o orch")
+		if m.chatWide {
+			hint = okStyle.Render("CHAT-WIDE") + " " + dimStyle.Render("mouse-drag copies chat only · f show tree · y yank · Y last")
+		} else if m.focus == focusTree {
+			hint = okStyle.Render("TREE") + " " + dimStyle.Render("j/k · enter · →/← · o orch · f chat-wide")
 		} else if m.mode == modeTaskDetail {
 			hint = dimStyle.Render("Task detail · type to orchestrator · o orch chat")
 		}
 		b.WriteString(hint)
 		b.WriteByte('\n')
 		b.WriteString("> " + m.input.View())
+	}
+	if m.statusFlash != "" {
+		b.WriteByte('\n')
+		b.WriteString(okStyle.Render(truncate(m.statusFlash, m.width-2)))
 	}
 	if m.errMsg != "" {
 		b.WriteByte('\n')
@@ -203,6 +222,7 @@ func (m Model) renderMain(w, h int) string {
 
 	var title, content string
 	keepBottom := true
+	trustViewport := false
 	switch m.mode {
 	case modeAgent:
 		title = "AGENT"
@@ -213,6 +233,7 @@ func (m Model) renderMain(w, h int) string {
 		if strings.TrimSpace(content) == "" {
 			content = dimStyle.Render("No agent output. Select a session and press enter.")
 		}
+		trustViewport = true
 	case modeRunDetail:
 		title = "RUN"
 		content = m.renderRunDetail(innerW, innerH-1)
@@ -231,12 +252,46 @@ func (m Model) renderMain(w, h int) string {
 	default:
 		title = "ORCHESTRATOR"
 		content = m.orchView.View()
+		trustViewport = true
+		keepBottom = false
 	}
 
 	inner := sectionStyle.Render(title) + "\n" + content
-	inner = fitBlock(inner, innerW, innerH, keepBottom)
 	active := m.focus == focusInput || m.focus == focusOptions
+	if trustViewport {
+		// Viewport already clipped/scrolled — pad by raw newlines only (no keepBottom rewrap).
+		return renderViewportPane(inner, w, h, active)
+	}
+	inner = fitBlock(inner, innerW, innerH, keepBottom)
 	return renderPane(inner, w, h, active, keepBottom)
+}
+
+// renderViewportPane borders content that a bubbles viewport already sized.
+// It pads/clips by raw newlines without wrapBlock+keepBottom (which hid older chat).
+func renderViewportPane(content string, outerW, outerH int, active bool) string {
+	innerW := outerW - 2
+	innerH := outerH - 2
+	if innerW < 1 {
+		innerW = 1
+	}
+	if innerH < 1 {
+		innerH = 1
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > innerH {
+		lines = lines[:innerH]
+	}
+	for len(lines) < innerH {
+		lines = append(lines, "")
+	}
+	content = strings.Join(lines, "\n")
+	style := borderStyle
+	if active {
+		style = activeBorder
+	}
+	style = style.Width(innerW).MaxWidth(innerW).Height(innerH).MaxHeight(innerH)
+	out := style.Render(content)
+	return clipScreenLines(out, outerH)
 }
 
 // renderPane draws a bordered box. lipgloss Width/Height are CONTENT sizes;
